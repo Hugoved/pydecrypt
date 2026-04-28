@@ -29,8 +29,8 @@ TEXT_HANDLER_TYPES = {b"text", b"sbtl", b"subt", b"clcp"}
 PIFF_TRACK_ENCRYPTION_UUID = bytes.fromhex("8974dbce7be74c5184f97148f9882554")
 PIFF_SAMPLE_ENCRYPTION_UUID = bytes.fromhex("a2394f525a9b4f14a2446c427c648df4")
 
-DEFAULT_COPY_CHUNK = 8 * 1024 * 1024
-PROGRESS_UPDATE_INTERVAL = 0.20
+DEFAULT_COPY_CHUNK = 32 * 1024 * 1024
+PROGRESS_UPDATE_INTERVAL = 0.50
 
 WEBM_ID_EBML = 0x1A45DFA3
 WEBM_ID_SEGMENT = 0x18538067
@@ -928,14 +928,24 @@ def decrypt_cenc_ctr(sample: bytes, key: bytes, iv: bytes, subsamples: List[Tupl
     cipher = Cipher(algorithms.AES(key), modes.CTR(counter_iv))
     decryptor = cipher.decryptor()
     if not subsamples:
-        return decryptor.update(sample) + decryptor.finalize()
+        out = bytearray(len(sample) + 15)
+        written = decryptor.update_into(sample, out)
+        tail = decryptor.finalize()
+        total = written + len(tail)
+        if tail:
+            out[written:total] = tail
+        return bytes(out[:total])
     out = bytearray(sample)
     pos = 0
     for clear_bytes, encrypted_bytes in subsamples:
         pos += clear_bytes
         if encrypted_bytes:
             end = pos + encrypted_bytes
-            out[pos:end] = decryptor.update(bytes(out[pos:end]))
+            src = memoryview(out)[pos:end]
+            dst = bytearray(encrypted_bytes + 15)
+            written = decryptor.update_into(src, dst)
+            if written:
+                out[pos:pos + written] = dst[:written]
             pos = end
     decryptor.finalize()
     return bytes(out)
@@ -946,36 +956,43 @@ def decrypt_cbcs(sample: bytes, key: bytes, iv: bytes, subsamples: List[Tuple[in
         iv = b"\x00" * 16
     if len(iv) < 16:
         iv = iv + (b"\x00" * (16 - len(iv)))
-    ecb = aes_ecb_decryptor(key)
     out = bytearray(sample)
     prev = iv
 
-    def decrypt_pattern(start: int, length: int):
+    def decrypt_cbc_run(start: int, length: int):
         nonlocal prev
+        usable = length - (length % 16)
+        if usable <= 0:
+            return
+        last_ciphertext_block = bytes(out[start + usable - 16:start + usable])
+        decryptor = Cipher(algorithms.AES(key), modes.CBC(prev)).decryptor()
+        dst = bytearray(usable + 15)
+        written = decryptor.update_into(memoryview(out)[start:start + usable], dst)
+        tail = decryptor.finalize()
+        total = written + len(tail)
+        if tail:
+            dst[written:total] = tail
+        out[start:start + usable] = dst[:total]
+        prev = last_ciphertext_block
+
+    def decrypt_pattern(start: int, length: int):
         pos = start
         remaining = length
         if crypt_blocks == 0 and skip_blocks == 0:
-            crypt_count = remaining // 16
-            for _ in range(crypt_count):
-                block = bytes(out[pos:pos + 16])
-                plain = bytes(a ^ b for a, b in zip(ecb.update(block), prev))
-                out[pos:pos + 16] = plain
-                prev = block
-                pos += 16
+            decrypt_cbc_run(pos, remaining)
             return
+        crypt_len = crypt_blocks * 16
+        skip_len = skip_blocks * 16
         while remaining >= 16:
-            for _ in range(crypt_blocks):
-                if remaining < 16:
-                    return
-                block = bytes(out[pos:pos + 16])
-                plain = bytes(a ^ b for a, b in zip(ecb.update(block), prev))
-                out[pos:pos + 16] = plain
-                prev = block
-                pos += 16
-                remaining -= 16
-            skip_len = min(remaining, skip_blocks * 16)
-            pos += skip_len
-            remaining -= skip_len
+            current_crypt = min(remaining - (remaining % 16), crypt_len)
+            if current_crypt <= 0:
+                return
+            decrypt_cbc_run(pos, current_crypt)
+            pos += current_crypt
+            remaining -= current_crypt
+            current_skip = min(remaining, skip_len)
+            pos += current_skip
+            remaining -= current_skip
 
     if not subsamples:
         decrypt_pattern(0, len(sample))
@@ -985,7 +1002,6 @@ def decrypt_cbcs(sample: bytes, key: bytes, iv: bytes, subsamples: List[Tuple[in
             pos += clear_bytes
             decrypt_pattern(pos, encrypted_bytes)
             pos += encrypted_bytes
-    ecb.finalize()
     return bytes(out)
 
 
@@ -1043,6 +1059,20 @@ def resolve_track_key(track: TrackInfo, keys_by_track: Dict[int, bytes], keys_by
     raise KeyError(f"No key found for track {track.track_id}")
 
 
+def resolve_default_sample_info(tenc: TencInfo) -> Optional[SampleAuxInfo]:
+    if tenc.iv_size == 0 and tenc.constant_iv:
+        return SampleAuxInfo(tenc.constant_iv, [])
+    return None
+
+
+def resolve_sample_info(aux_info: List[SampleAuxInfo], index: int, tenc: TencInfo) -> Optional[SampleAuxInfo]:
+    if aux_info:
+        if index >= len(aux_info):
+            return None
+        return aux_info[index]
+    return resolve_default_sample_info(tenc)
+
+
 def apply_track_decryption(data: bytearray, track: TrackInfo, key: bytes):
     if not track.tenc or not track.sample_offsets or not track.sample_sizes:
         return
@@ -1051,7 +1081,9 @@ def apply_track_decryption(data: bytearray, track: TrackInfo, key: bytes):
     for index, (offset, size) in enumerate(zip(track.sample_offsets, track.sample_sizes)):
         if offset + size > len(data):
             raise ValueError(f"Track {track.track_id} sample {index + 1} exceeds file size")
-        info = track.aux_info[index] if track.aux_info else SampleAuxInfo(track.tenc.constant_iv if track.tenc.iv_size == 0 else b"\x00" * track.tenc.iv_size, [])
+        info = resolve_sample_info(track.aux_info, index, track.tenc)
+        if info is None:
+            continue
         sample = bytes(data[offset:offset + size])
         data[offset:offset + size] = decrypt_sample(sample, key, info, track.scheme, track.tenc, track.codec_format, track.nal_length_size, track.nal_header_clear_bytes)
     patch_sample_description(data, track)
@@ -1065,7 +1097,9 @@ def apply_fragment_decryption(data: bytearray, run: FragmentRun, key: bytes):
     for index, (offset, size) in enumerate(zip(run.sample_offsets, run.sample_sizes)):
         if offset + size > len(data):
             raise ValueError(f"Fragment track {run.track_id} sample {index + 1} exceeds file size")
-        info = run.aux_info[index] if run.aux_info else SampleAuxInfo(run.tenc.constant_iv if run.tenc.iv_size == 0 else b"\x00" * run.tenc.iv_size, [])
+        info = resolve_sample_info(run.aux_info, index, run.tenc)
+        if info is None:
+            continue
         sample = bytes(data[offset:offset + size])
         data[offset:offset + size] = decrypt_sample(sample, key, info, run.scheme, run.tenc)
 
@@ -1271,6 +1305,7 @@ def collect_metadata_patches(data, parser: Mp4Parser, tracks: Dict[int, TrackInf
 
 def collect_decrypt_tasks(tracks: Dict[int, TrackInfo], fragments: List[FragmentRun], keys_by_track: Dict[int, bytes], keys_by_kid: Dict[bytes, bytes]) -> List[DecryptTask]:
     tasks: List[DecryptTask] = []
+    skipped_without_iv = 0
     decrypted_any = False
     for track_id in sorted(tracks):
         track = tracks[track_id]
@@ -1280,7 +1315,10 @@ def collect_decrypt_tasks(tracks: Dict[int, TrackInfo], fragments: List[Fragment
             raise ValueError(f"Track {track.track_id} has mismatched sample encryption info")
         key = resolve_track_key(track, keys_by_track, keys_by_kid)
         for index, (offset, size) in enumerate(zip(track.sample_offsets, track.sample_sizes)):
-            info = track.aux_info[index] if track.aux_info else SampleAuxInfo(track.tenc.constant_iv if track.tenc.iv_size == 0 else b"\x00" * track.tenc.iv_size, [])
+            info = resolve_sample_info(track.aux_info, index, track.tenc)
+            if info is None:
+                skipped_without_iv += 1
+                continue
             tasks.append(DecryptTask(offset, size, key, info, track.scheme, track.tenc, track.codec_format, track.nal_length_size, track.nal_header_clear_bytes))
             decrypted_any = True
     for run in fragments:
@@ -1293,9 +1331,14 @@ def collect_decrypt_tasks(tracks: Dict[int, TrackInfo], fragments: List[Fragment
             raise RuntimeError(f"Missing initialization track for fragment track {run.track_id}")
         key = resolve_track_key(track, keys_by_track, keys_by_kid)
         for index, (offset, size) in enumerate(zip(run.sample_offsets, run.sample_sizes)):
-            info = run.aux_info[index] if run.aux_info else SampleAuxInfo(run.tenc.constant_iv if run.tenc.iv_size == 0 else b"\x00" * run.tenc.iv_size, [])
+            info = resolve_sample_info(run.aux_info, index, run.tenc)
+            if info is None:
+                skipped_without_iv += 1
+                continue
             tasks.append(DecryptTask(offset, size, key, info, run.scheme, run.tenc, track.codec_format, track.nal_length_size, track.nal_header_clear_bytes))
             decrypted_any = True
+    if skipped_without_iv:
+        print(f"Skipped {skipped_without_iv} samples without IV/subsample metadata; they were preserved as clear samples")
     if not decrypted_any:
         raise RuntimeError("No encrypted samples were decrypted")
     tasks.sort(key=lambda x: (x.start, x.end))
@@ -1322,7 +1365,7 @@ def build_events(metadata_patches: List[BytePatch], decrypt_tasks: List[DecryptT
     return events
 
 
-def stream_copy_range(mm, out_file, start: int, end: int, progress: ProgressPrinter, chunk_size: int = 8 * 1024 * 1024):
+def stream_copy_range(mm, out_file, start: int, end: int, progress: ProgressPrinter, chunk_size: int = DEFAULT_COPY_CHUNK):
     pos = start
     while pos < end:
         chunk_end = min(end, pos + chunk_size)
@@ -1931,7 +1974,7 @@ def decrypt_mp4_file(input_path: str, output_path: str, keys_by_track: Dict[int,
                         stream_write_data(output_file, patch.data, patch.end, progress)
                     else:
                         task = event.payload
-                        sample = bytes(mm[task.start:task.end])
+                        sample = mm[task.start:task.end]
                         clear = decrypt_sample(sample, task.key, task.info, task.scheme, task.tenc, task.codec_format, task.nal_length_size, task.nal_header_clear_bytes)
                         stream_write_data(output_file, clear, task.end, progress)
                     cursor = event.end
@@ -1964,7 +2007,6 @@ def main():
         return
 
     decrypt_mp4_file(args.i, args.o, keys_by_track, keys_by_kid, show_tracks=args.show_tracks)
-
 
 if __name__ == "__main__":
     try:

@@ -35,6 +35,51 @@ python pydecrypt.py -i input_file -o output_file -k KID:KEY
 
 ---
 
+## Script Example
+
+The following example demonstrates a structured way to use **pydecrypt** within a standalone script:
+
+```python
+import sys
+import pydecrypt
+
+input_file = "encrypted_media.mp4"
+output_file = "decrypted_media.mp4"
+decryption_key = "de16439108cc4754bfb9dadc03a258a0:331a70d43154c5aca52a37e875623ac4"
+
+show_tracks = True
+preserve_text_tracks = False
+
+try:
+    keys_by_track, keys_by_kid = pydecrypt.parse_keys([decryption_key])
+
+    if pydecrypt.is_webm_file(input_file):
+        pydecrypt.decrypt_webm_file(
+            input_path=input_file,
+            output_path=output_file,
+            keys_by_track=keys_by_track,
+            keys_by_kid=keys_by_kid,
+            show_tracks=show_tracks,
+            drop_text=not preserve_text_tracks,
+        )
+    else:
+        pydecrypt.decrypt_mp4_file(
+            input_path=input_file,
+            output_path=output_file,
+            keys_by_track=keys_by_track,
+            keys_by_kid=keys_by_kid,
+            show_tracks=show_tracks,
+        )
+
+except KeyboardInterrupt:
+    raise SystemExit(130)
+except Exception as error:
+    print(f"Decryption failed: {error}", file=sys.stderr)
+    raise SystemExit(1)
+```
+
+---
+
 ## Notes
 
 This project was developed primarily as a personal initiative to better understand the structure and encryption mechanisms of **WebM files**.

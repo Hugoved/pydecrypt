@@ -1400,6 +1400,42 @@ def stream_write_data(out_file, data: bytes, end_offset: int, progress: Progress
     progress.update(end_offset)
 
 
+def stream_copy_range_without_progress(source, out_file, start: int, end: int, chunk_size: int = DEFAULT_COPY_CHUNK):
+    pos = start
+    while pos < end:
+        chunk_end = min(end, pos + chunk_size)
+        out_file.write(source[pos:chunk_end])
+        pos = chunk_end
+
+
+def read_source_range(source, start: int, end: int) -> bytes:
+    if end < start:
+        raise ValueError("Invalid source range")
+    return bytes(source[start:end])
+
+
+def iter_ebml_elements(buf, start: int, end: int):
+    effective_end = min(end, len(buf))
+    pos = start
+    while pos < effective_end:
+        if pos >= len(buf):
+            break
+        id_value, id_len, id_bytes = read_ebml_id(buf, pos)
+        size_value, size_len, unknown = read_ebml_size(buf, pos + id_len)
+        data_start = pos + id_len + size_len
+        if data_start > effective_end:
+            raise ValueError("EBML header exceeds parent boundary")
+        if size_value is None:
+            data_end = effective_end
+        else:
+            raw_end = data_start + size_value
+            data_end = raw_end if raw_end <= effective_end else effective_end
+        yield EbmlElement(id_value, id_bytes, size_value, size_len, data_start, data_end, pos, data_start, data_end, unknown)
+        if data_end <= pos:
+            raise ValueError("EBML parser did not advance")
+        pos = data_end
+
+
 def is_webm_file(path: str) -> bool:
     with open(path, "rb") as f:
         return f.read(4) == b"\x1a\x45\xdf\xa3"
@@ -1801,85 +1837,111 @@ def resolve_webm_track_keys(tracks: Dict[int, WebMTrack], keys_by_track: Dict[in
 
 
 def decrypt_webm_file(input_path: str, output_path: str, keys_by_track: Dict[int, bytes], keys_by_kid: Dict[bytes, bytes], show_tracks: bool, drop_text: bool):
-    source = Path(input_path).read_bytes()
-    top = parse_ebml_elements(source, 0, len(source))
-    segment = None
-    for element in top:
-        if element.id_value == WEBM_ID_SEGMENT:
-            segment = element
-            break
-    if segment is None:
-        fail("WebM Segment element was not found")
-    tracks_element = None
-    for child in parse_ebml_elements(source, segment.data_start, segment.data_end):
-        if child.id_value == WEBM_ID_TRACKS:
-            tracks_element = child
-            break
-    if tracks_element is None:
-        fail("WebM Tracks element was not found")
-    tracks_payload = source[tracks_element.data_start:tracks_element.data_end]
-    discovered_tracks = parse_webm_tracks(tracks_payload)
-    if show_tracks:
-        print_webm_tracks(discovered_tracks)
-    ensure_supplied_webm_kids_match(discovered_tracks, keys_by_kid)
-    track_keys = resolve_webm_track_keys(discovered_tracks, keys_by_track, keys_by_kid)
-    decrypt_track_numbers = set(track_keys)
+    file_size = os.path.getsize(input_path)
+    if file_size <= 0:
+        fail("Input file is empty")
 
-    progress = ProgressPrinter(len(source))
-    processed = [0]
-    output = bytearray()
-    cursor = 0
-    for element in top:
-        if cursor < element.header_start:
-            output.extend(source[cursor:element.header_start])
-            processed[0] += element.header_start - cursor
-            progress.update(processed[0])
-        if element.id_value != WEBM_ID_SEGMENT:
-            output.extend(source[element.header_start:element.end])
-            processed[0] += element.end - element.header_start
-            progress.update(processed[0])
-            cursor = element.end
-            continue
-        segment_payload_out = bytearray()
-        inner_cursor = element.data_start
-        for child in parse_ebml_elements(source, element.data_start, element.data_end):
-            if inner_cursor < child.header_start:
-                segment_payload_out.extend(source[inner_cursor:child.header_start])
-            child_payload = source[child.data_start:child.data_end]
-            if child.id_value == WEBM_ID_TRACKS:
-                rewritten_tracks, _ = rewrite_webm_tracks_payload(child_payload, decrypt_track_numbers, drop_text)
-                segment_payload_out.extend(encode_webm_element(child.id_bytes, rewritten_tracks, child.size_len))
-            elif child.id_value == WEBM_ID_CLUSTER:
-                rewritten_cluster = rewrite_webm_cluster_payload(child_payload, track_keys, progress, processed)
-                segment_payload_out.extend(encode_webm_element(child.id_bytes, rewritten_cluster, child.size_len))
-            elif child.id_value in {WEBM_ID_SEEK_HEAD, WEBM_ID_CUES, WEBM_ID_CRC32}:
-                pass
-            else:
-                segment_payload_out.extend(source[child.header_start:child.end])
-                processed[0] += child.end - child.header_start
-                progress.update(processed[0])
-            inner_cursor = child.end
-        if inner_cursor < element.data_end:
-            segment_payload_out.extend(source[inner_cursor:element.data_end])
-            processed[0] += element.data_end - inner_cursor
-            progress.update(processed[0])
-        segment_header = element.id_bytes + encode_ebml_size(len(segment_payload_out), element.size_len, force_unknown=element.unknown_size)
-        output.extend(segment_header)
-        output.extend(segment_payload_out)
-        cursor = element.end
-    if cursor < len(source):
-        output.extend(source[cursor:])
-        processed[0] += len(source) - cursor
-        progress.update(processed[0])
-    Path(output_path).write_bytes(output)
-    progress.finish()
+    with open(input_path, "rb") as in_file:
+        with mmap.mmap(in_file.fileno(), 0, access=mmap.ACCESS_READ) as source:
+            top = list(iter_ebml_elements(source, 0, file_size))
+            segment = None
+            for element in top:
+                if element.id_value == WEBM_ID_SEGMENT:
+                    segment = element
+                    break
+            if segment is None:
+                fail("WebM Segment element was not found")
+
+            tracks_element = None
+            for child in iter_ebml_elements(source, segment.data_start, segment.data_end):
+                if child.id_value == WEBM_ID_TRACKS:
+                    tracks_element = child
+                    break
+            if tracks_element is None:
+                fail("WebM Tracks element was not found")
+
+            tracks_payload = read_source_range(source, tracks_element.data_start, tracks_element.data_end)
+            discovered_tracks = parse_webm_tracks(tracks_payload)
+            if show_tracks:
+                print_webm_tracks(discovered_tracks)
+            ensure_supplied_webm_kids_match(discovered_tracks, keys_by_kid)
+            track_keys = resolve_webm_track_keys(discovered_tracks, keys_by_track, keys_by_kid)
+            decrypt_track_numbers = set(track_keys)
+
+            progress = ProgressPrinter(file_size)
+            processed = [0]
+            segment_size_len = segment.size_len if segment.size_len else 8
+            if segment_size_len < 1 or segment_size_len > 8:
+                segment_size_len = 8
+
+            with open(output_path, "wb") as out_file:
+                cursor = 0
+                for element in top:
+                    if cursor < element.header_start:
+                        stream_copy_range_without_progress(source, out_file, cursor, element.header_start)
+                        processed[0] += element.header_start - cursor
+                        progress.update(processed[0])
+
+                    if element.id_value != WEBM_ID_SEGMENT:
+                        stream_copy_range_without_progress(source, out_file, element.header_start, element.end)
+                        processed[0] += element.end - element.header_start
+                        progress.update(processed[0])
+                        cursor = element.end
+                        continue
+
+                    out_file.write(element.id_bytes)
+                    out_file.write(encode_ebml_size(0, segment_size_len, force_unknown=True))
+                    processed[0] += element.header_end - element.header_start
+                    progress.update(processed[0])
+
+                    inner_cursor = element.data_start
+                    for child in iter_ebml_elements(source, element.data_start, element.data_end):
+                        if inner_cursor < child.header_start:
+                            stream_copy_range_without_progress(source, out_file, inner_cursor, child.header_start)
+                            processed[0] += child.header_start - inner_cursor
+                            progress.update(processed[0])
+
+                        if child.id_value == WEBM_ID_TRACKS:
+                            child_payload = read_source_range(source, child.data_start, child.data_end)
+                            rewritten_tracks, _ = rewrite_webm_tracks_payload(child_payload, decrypt_track_numbers, drop_text)
+                            out_file.write(encode_webm_element(child.id_bytes, rewritten_tracks, child.size_len))
+                            processed[0] += child.end - child.header_start
+                            progress.update(processed[0])
+                        elif child.id_value == WEBM_ID_CLUSTER:
+                            child_payload = read_source_range(source, child.data_start, child.data_end)
+                            rewritten_cluster = rewrite_webm_cluster_payload(child_payload, track_keys, progress, processed)
+                            out_file.write(encode_webm_element(child.id_bytes, rewritten_cluster, child.size_len))
+                        elif child.id_value in {WEBM_ID_SEEK_HEAD, WEBM_ID_CUES, WEBM_ID_CRC32}:
+                            processed[0] += child.end - child.header_start
+                            progress.update(processed[0])
+                        else:
+                            stream_copy_range_without_progress(source, out_file, child.header_start, child.end)
+                            processed[0] += child.end - child.header_start
+                            progress.update(processed[0])
+
+                        inner_cursor = child.end
+
+                    if inner_cursor < element.data_end:
+                        stream_copy_range_without_progress(source, out_file, inner_cursor, element.data_end)
+                        processed[0] += element.data_end - inner_cursor
+                        progress.update(processed[0])
+
+                    cursor = element.end
+
+                if cursor < file_size:
+                    stream_copy_range_without_progress(source, out_file, cursor, file_size)
+                    processed[0] += file_size - cursor
+                    progress.update(processed[0])
+
+            progress.finish()
     print("Decrypted successfully")
     if output_path.lower().endswith(".mp4"):
         print("WARNING: The output container is still WebM. Use a .webm or .mkv extension unless you remux it afterward.")
 
 
 def extract_webm_kids_quick(path: str, max_scan_bytes: int = 16 * 1024 * 1024) -> List[bytes]:
-    data = Path(path).read_bytes()[:max_scan_bytes]
+    with open(path, "rb") as f:
+        data = f.read(max_scan_bytes)
     results: List[bytes] = []
     def walk(offset, end):
         while offset < end and offset < len(data):
@@ -2727,6 +2789,9 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         raise SystemExit(130)
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        raise SystemExit(1)
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
         raise SystemExit(1)

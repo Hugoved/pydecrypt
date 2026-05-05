@@ -29,8 +29,22 @@ pip install cryptography
 
 ## Usage
 
+Basic:
+
 ```bash
-python pydecrypt.py -i input_file -o output_file -k KID:KEY
+python pydecrypt.py -i input.mp4 -o output.mp4 -k KID:KEY
+```
+
+With track info:
+
+```bash
+python pydecrypt.py -i input.mp4 -o output.mp4 -k KID:KEY --show-tracks
+```
+
+With SEI fix (only applied when needed):
+
+```bash
+python pydecrypt.py -i input.mp4 -o output.mp4 -k KID:KEY --fix-sei
 ```
 
 ---
@@ -49,6 +63,7 @@ decryption_key = "de16439108cc4754bfb9dadc03a258a0:331a70d43154c5aca52a37e875623
 
 show_tracks = True
 preserve_text_tracks = False
+fix_sei = False
 
 try:
     keys_by_track, keys_by_kid = pydecrypt.parse_keys([decryption_key])
@@ -69,6 +84,8 @@ try:
             keys_by_track=keys_by_track,
             keys_by_kid=keys_by_kid,
             show_tracks=show_tracks,
+            drop_text=not preserve_text_tracks,
+            fix_sei=fix_sei,
         )
 
 except KeyboardInterrupt:
@@ -76,7 +93,6 @@ except KeyboardInterrupt:
 except Exception as error:
     print(f"Decryption failed: {error}", file=sys.stderr)
     raise SystemExit(1)
-```
 
 ---
 

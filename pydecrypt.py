@@ -2210,6 +2210,10 @@ def fp_parse_sample_entry_and_protection(data, trak_start, trak_end):
     skip_blocks = 0
     original_format = ""
     sample_entry_start = None
+    sample_entry_end = None
+    codec_format = ""
+    nal_length_size = 0
+    nal_header_clear_bytes = 0
     tenc_is_protected_offset = None
     tenc_iv_size_offset = None
     for stsd_start, stsd_end, stsd_header, stsd_type in fp_recursive_boxes(data, trak_start, trak_end, {"stsd"}):
@@ -2219,6 +2223,19 @@ def fp_parse_sample_entry_and_protection(data, trak_start, trak_end):
             entry_size = fp_be32(data, entry_offset)
             entry_type = bytes(data[entry_offset + 4:entry_offset + 8]).decode("latin1")
             sample_entry_start = entry_offset
+            sample_entry_end = entry_offset + entry_size
+            scan_skip = 8
+            if entry_type in {"avc1", "avc3", "encv", "hvc1", "hev1", "dvhe", "dvh1"}:
+                scan_skip = 86
+            for cfg_start, cfg_end, cfg_header, cfg_type in fp_recursive_boxes(data, entry_offset + scan_skip, entry_offset + entry_size, {"avcC", "hvcC"}):
+                if cfg_type == "avcC" and cfg_start + cfg_header + 5 <= cfg_end:
+                    codec_format = "avc1"
+                    nal_length_size = (data[cfg_start + cfg_header + 4] & 3) + 1
+                    nal_header_clear_bytes = 1
+                elif cfg_type == "hvcC" and cfg_start + cfg_header + 22 <= cfg_end:
+                    codec_format = "hvc1"
+                    nal_length_size = (data[cfg_start + cfg_header + 21] & 3) + 1
+                    nal_header_clear_bytes = 2
     for frma_start, frma_end, frma_header, frma_type in fp_recursive_boxes(data, trak_start, trak_end, {"frma"}):
         if frma_start + frma_header + 4 <= frma_end:
             original_format = bytes(data[frma_start + frma_header:frma_start + frma_header + 4]).decode("latin1")
@@ -2248,7 +2265,7 @@ def fp_parse_sample_entry_and_protection(data, trak_start, trak_end):
             iv_length = data[offset]
             offset += 1
             default_constant_iv = bytes(data[offset:offset + iv_length])
-    return entry_type, scheme, default_kid, default_is_protected, default_iv_size, default_constant_iv, crypt_blocks, skip_blocks, original_format, sample_entry_start, tenc_is_protected_offset, tenc_iv_size_offset
+    return entry_type, scheme, default_kid, default_is_protected, default_iv_size, default_constant_iv, crypt_blocks, skip_blocks, original_format, sample_entry_start, tenc_is_protected_offset, tenc_iv_size_offset, codec_format, nal_length_size, nal_header_clear_bytes
 
 
 def fp_parse_moov(data, moov_start, moov_end):
@@ -2270,7 +2287,7 @@ def fp_parse_moov(data, moov_start, moov_end):
         if track_id is None:
             continue
         handler = fp_parse_hdlr_type(data, trak_start + trak_header, trak_end)
-        entry_type, scheme, default_kid, protected, iv_size, constant_iv, crypt_blocks, skip_blocks, original_format, sample_entry_start, tenc_is_protected_offset, tenc_iv_size_offset = fp_parse_sample_entry_and_protection(data, trak_start + trak_header, trak_end)
+        entry_type, scheme, default_kid, protected, iv_size, constant_iv, crypt_blocks, skip_blocks, original_format, sample_entry_start, tenc_is_protected_offset, tenc_iv_size_offset, codec_format, nal_length_size, nal_header_clear_bytes = fp_parse_sample_entry_and_protection(data, trak_start + trak_header, trak_end)
         tracks[track_id] = {
             "id": track_id,
             "handler": handler,
@@ -2286,7 +2303,10 @@ def fp_parse_moov(data, moov_start, moov_end):
             "original_format": original_format,
             "sample_entry_start": sample_entry_start,
             "tenc_is_protected_offset": tenc_is_protected_offset,
-            "tenc_iv_size_offset": tenc_iv_size_offset
+            "tenc_iv_size_offset": tenc_iv_size_offset,
+            "codec_format": codec_format,
+            "nal_length_size": nal_length_size,
+            "nal_header_clear_bytes": nal_header_clear_bytes
         }
     return tracks
 
@@ -2400,26 +2420,132 @@ def fp_print_progress(index, total, start_time):
     sys.stdout.flush()
 
 
+
+
+def fp_decrypt_ctr_subsamples(buffer, sample_start, subsamples, key, iv):
+    encrypted_ranges = []
+    cursor = sample_start
+    for clear_size, encrypted_size in subsamples:
+        cursor += clear_size
+        if encrypted_size > 0:
+            encrypted_ranges.append((cursor, encrypted_size))
+        cursor += encrypted_size
+    if not encrypted_ranges:
+        return
+    encrypted_blob = b"".join(bytes(buffer[start:start + size]) for start, size in encrypted_ranges)
+    decrypt = fp_make_aes_ctr_decryptor(key, iv)
+    decrypted_blob = decrypt(encrypted_blob)
+    offset = 0
+    for start, size in encrypted_ranges:
+        buffer[start:start + size] = decrypted_blob[offset:offset + size]
+        offset += size
+
+
+def fp_decrypt_cbc_pattern_subsamples(buffer, sample_start, subsamples, key, iv, crypt_blocks, skip_blocks):
+    encrypted_ranges = []
+
+    def collect_pattern_ranges(start, size):
+        full = size - (size % 16)
+        if full <= 0:
+            return
+        if crypt_blocks <= 0 and skip_blocks <= 0:
+            encrypted_ranges.append((start, full))
+            return
+        if crypt_blocks <= 0:
+            return
+        if skip_blocks <= 0:
+            encrypted_ranges.append((start, full))
+            return
+        cursor = start
+        remaining = full
+        crypt_bytes = crypt_blocks * 16
+        skip_bytes = skip_blocks * 16
+        while remaining >= 16:
+            take = min(crypt_bytes, remaining)
+            take -= take % 16
+            if take <= 0:
+                break
+            encrypted_ranges.append((cursor, take))
+            cursor += take
+            remaining -= take
+            skip = min(skip_bytes, remaining)
+            cursor += skip
+            remaining -= skip
+
+    cursor = sample_start
+    for clear_size, encrypted_size in subsamples:
+        cursor += clear_size
+        collect_pattern_ranges(cursor, encrypted_size)
+        cursor += encrypted_size
+
+    if not encrypted_ranges:
+        return
+    encrypted_blob = b"".join(bytes(buffer[start:start + size]) for start, size in encrypted_ranges)
+    encrypted_blob = encrypted_blob[:len(encrypted_blob) - (len(encrypted_blob) % 16)]
+    if not encrypted_blob:
+        return
+    decrypt = fp_make_aes_cbc_decryptor(key, iv)
+    decrypted_blob = decrypt(encrypted_blob)
+    offset = 0
+    remaining = len(decrypted_blob)
+    for start, size in encrypted_ranges:
+        take = min(size, remaining - offset)
+        if take <= 0:
+            break
+        buffer[start:start + take] = decrypted_blob[offset:offset + take]
+        offset += take
+
+def fp_build_length_prefixed_nal_subsamples(buffer, sample_start, sample_size, nal_length_size, nal_header_clear_bytes):
+    if nal_length_size <= 0 or nal_header_clear_bytes < 0 or sample_size <= 0:
+        return []
+    end = sample_start + sample_size
+    cursor = sample_start
+    subsamples = []
+    while cursor < end:
+        if cursor + nal_length_size > end:
+            return []
+        nal_size = int.from_bytes(buffer[cursor:cursor + nal_length_size], "big")
+        cursor += nal_length_size
+        if nal_size == 0:
+            subsamples.append((nal_length_size, 0))
+            continue
+        if cursor + nal_size > end:
+            return []
+        clear_payload = min(nal_header_clear_bytes, nal_size)
+        encrypted_payload = max(0, nal_size - clear_payload)
+        subsamples.append((nal_length_size + clear_payload, encrypted_payload))
+        cursor += nal_size
+    return subsamples
+
 def fp_decrypt_sample(buffer, sample_start, sample_size, sample_aux, track, key):
     iv, subsamples = sample_aux
     scheme = track["scheme"].lower()
     crypt_blocks = track["crypt_blocks"]
     skip_blocks = track["skip_blocks"]
     if not subsamples:
-        if scheme in ("cenc", "cens"):
-            fp_decrypt_ctr_range(buffer, sample_start, sample_size, key, iv)
-        else:
-            fp_decrypt_cbc_pattern_range(buffer, sample_start, sample_size, key, iv, crypt_blocks, skip_blocks)
-        return
-    cursor = sample_start
-    for clear_size, encrypted_size in subsamples:
-        cursor += clear_size
-        if encrypted_size > 0:
-            if scheme in ("cenc", "cens"):
-                fp_decrypt_ctr_range(buffer, cursor, encrypted_size, key, iv)
+        codec_format = str(track.get("codec_format", "")).lower()
+        nal_length_size = int(track.get("nal_length_size", 0) or 0)
+        nal_header_clear_bytes = int(track.get("nal_header_clear_bytes", 0) or 0)
+        if codec_format in {"avc1", "hvc1"} and nal_length_size > 0:
+            guessed = fp_build_length_prefixed_nal_subsamples(buffer, sample_start, sample_size, nal_length_size, nal_header_clear_bytes)
+            if guessed:
+                subsamples = guessed
             else:
-                fp_decrypt_cbc_pattern_range(buffer, cursor, encrypted_size, key, iv, crypt_blocks, skip_blocks)
-        cursor += encrypted_size
+                if scheme in ("cenc", "cens"):
+                    fp_decrypt_ctr_range(buffer, sample_start, sample_size, key, iv)
+                else:
+                    fp_decrypt_cbc_pattern_range(buffer, sample_start, sample_size, key, iv, crypt_blocks, skip_blocks)
+                return
+        else:
+            if scheme in ("cenc", "cens"):
+                fp_decrypt_ctr_range(buffer, sample_start, sample_size, key, iv)
+            else:
+                fp_decrypt_cbc_pattern_range(buffer, sample_start, sample_size, key, iv, crypt_blocks, skip_blocks)
+            return
+    if scheme in ("cenc", "cens"):
+        fp_decrypt_ctr_subsamples(buffer, sample_start, subsamples, key, iv)
+    else:
+        fp_decrypt_cbc_pattern_subsamples(buffer, sample_start, subsamples, key, iv, crypt_blocks, skip_blocks)
 
 
 def fp_collect_fragments(data, tracks):
@@ -2515,7 +2641,7 @@ def fp_disable_text_tracks_in_place(data):
             continue
         track_id = fp_parse_tkhd_track_id(data, trak_start + trak_header, trak_end)
         handler = fp_parse_hdlr_type(data, trak_start + trak_header, trak_end).lower()
-        entry_type, scheme, default_kid, protected, iv_size, constant_iv, crypt_blocks, skip_blocks, original_format, sample_entry_start, tenc_is_protected_offset, tenc_iv_size_offset = fp_parse_sample_entry_and_protection(data, trak_start + trak_header, trak_end)
+        entry_type, scheme, default_kid, protected, iv_size, constant_iv, crypt_blocks, skip_blocks, original_format, sample_entry_start, tenc_is_protected_offset, tenc_iv_size_offset, codec_format, nal_length_size, nal_header_clear_bytes = fp_parse_sample_entry_and_protection(data, trak_start + trak_header, trak_end)
         if track_id is not None and (handler in {"text", "sbtl", "subt", "clcp"} or entry_type.lower() in {"c608", "tx3g", "wvtt", "stpp", "sbtt", "enct"}):
             text_track_ids.add(track_id)
             data[trak_start + 4:trak_start + 8] = b"free"
@@ -2581,7 +2707,7 @@ def fp_collect_text_track_patches(data):
             continue
         track_id = fp_parse_tkhd_track_id(data, trak_start + trak_header, trak_end)
         handler = fp_parse_hdlr_type(data, trak_start + trak_header, trak_end).lower()
-        entry_type, scheme, default_kid, protected, iv_size, constant_iv, crypt_blocks, skip_blocks, original_format, sample_entry_start, tenc_is_protected_offset, tenc_iv_size_offset = fp_parse_sample_entry_and_protection(data, trak_start + trak_header, trak_end)
+        entry_type, scheme, default_kid, protected, iv_size, constant_iv, crypt_blocks, skip_blocks, original_format, sample_entry_start, tenc_is_protected_offset, tenc_iv_size_offset, codec_format, nal_length_size, nal_header_clear_bytes = fp_parse_sample_entry_and_protection(data, trak_start + trak_header, trak_end)
         if track_id is not None and (handler in {"text", "sbtl", "subt", "clcp"} or entry_type.lower() in {"c608", "tx3g", "wvtt", "stpp", "sbtt", "enct"}):
             text_track_ids.add(track_id)
             patches.append((trak_start + 4, b"free"))
@@ -2742,25 +2868,42 @@ def fp_repair_hevc_sei_rbsp_stop(sample):
     return bytes(repaired) if changed else sample
 
 
-def fp_decrypt_sample_to_bytes(data, sample_start, sample_size, sample_aux, track, key):
+def fp_track_uses_hevc_bitstream(track):
+    original_format = str(track.get("original_format") or track.get("entry_type") or "").lower()
+    codec_format = str(track.get("codec_format") or "").lower()
+    return original_format in {"hev1", "hvc1", "dvhe", "dvh1"} or codec_format in {"hev1", "hvc1", "dvhe", "dvh1"}
+
+
+def fp_decrypt_sample_to_bytes(data, sample_start, sample_size, sample_aux, track, key, fix_sei=False):
     sample = bytearray(data[sample_start:sample_start + sample_size])
     fp_decrypt_sample(sample, 0, sample_size, sample_aux, track, key)
     result = bytes(sample)
-    original_format = str(track.get("original_format") or track.get("entry_type") or "").lower()
-    if original_format in {"hev1", "hvc1", "dvhe", "dvh1"}:
+    if fix_sei and fp_track_uses_hevc_bitstream(track):
         result = fp_repair_hevc_sei_rbsp_stop(result)
     return result
 
 
-def fp_collect_growth_patches(data, decrypt_events):
+def fp_collect_growth_patches(data, decrypt_events, fix_sei=False):
     patches = []
     trun_size_deltas = {}
     mdat_size_deltas = {}
     growth_count = 0
 
+    if not fix_sei:
+        return patches, growth_count
+
+    hevc_events = []
     for event_start, event_end, event_kind, event_payload in decrypt_events:
         sample_start, sample_size, sample_aux, track, key, sample_size_offset, mdat_size_offset = event_payload
-        decrypted = fp_decrypt_sample_to_bytes(data, sample_start, sample_size, sample_aux, track, key)
+        if fp_track_uses_hevc_bitstream(track):
+            hevc_events.append((event_start, event_end, event_kind, event_payload))
+
+    if not hevc_events:
+        return patches, growth_count
+
+    for event_start, event_end, event_kind, event_payload in hevc_events:
+        sample_start, sample_size, sample_aux, track, key, sample_size_offset, mdat_size_offset = event_payload
+        decrypted = fp_decrypt_sample_to_bytes(data, sample_start, sample_size, sample_aux, track, key, fix_sei=True)
         delta = len(decrypted) - sample_size
         if delta <= 0:
             continue
@@ -2824,7 +2967,7 @@ def fp_prepare_decrypt_events(fragments, tracks, fast_keys):
     return events
 
 
-def fp_stream_decrypt_to_output(data, output_path, patch_events, decrypt_events):
+def fp_stream_decrypt_to_output(data, output_path, patch_events, decrypt_events, fix_sei=False):
     events = patch_events + decrypt_events
     events.sort(key=lambda item: (item[0], 0 if item[2] == "patch" else 1, item[1]))
     previous_end = -1
@@ -2850,7 +2993,7 @@ def fp_stream_decrypt_to_output(data, output_path, patch_events, decrypt_events)
                 out_file.write(event_payload)
             else:
                 sample_start, sample_size, sample_aux, track, key, sample_size_offset, mdat_size_offset = event_payload
-                out_file.write(fp_decrypt_sample_to_bytes(data, sample_start, sample_size, sample_aux, track, key))
+                out_file.write(fp_decrypt_sample_to_bytes(data, sample_start, sample_size, sample_aux, track, key, fix_sei=fix_sei))
                 processed += 1
                 ratio = processed / total_samples if total_samples else 1.0
                 if ratio >= next_progress or processed == total_samples:
@@ -2867,7 +3010,7 @@ def fp_stream_decrypt_to_output(data, output_path, patch_events, decrypt_events)
     print()
 
 
-def decrypt_mp4_file(input_path: str, output_path: str, keys_by_track: Dict[int, bytes], keys_by_kid: Dict[bytes, bytes], show_tracks: bool = False, drop_text: bool = True):
+def decrypt_mp4_file(input_path: str, output_path: str, keys_by_track: Dict[int, bytes], keys_by_kid: Dict[bytes, bytes], show_tracks: bool = False, drop_text: bool = True, fix_sei: bool = False):
     if not os.path.isfile(input_path):
         fail("Input file does not exist")
 
@@ -2916,10 +3059,10 @@ def decrypt_mp4_file(input_path: str, output_path: str, keys_by_track: Dict[int,
                 patches.extend(fp_collect_text_track_patches(data))
             patches.extend(fp_collect_decrypted_mp4_metadata_patches(data, tracks))
             decrypt_events = fp_prepare_decrypt_events(fragments, tracks, fast_keys)
-            growth_patches, repaired_sei_count = fp_collect_growth_patches(data, decrypt_events)
+            growth_patches, repaired_sei_count = fp_collect_growth_patches(data, decrypt_events, fix_sei=fix_sei)
             patches.extend(growth_patches)
             patch_events = fp_prepare_patch_events(patches)
-            fp_stream_decrypt_to_output(data, output_path, patch_events, decrypt_events)
+            fp_stream_decrypt_to_output(data, output_path, patch_events, decrypt_events, fix_sei=fix_sei)
             print("Decrypted successfully")
         finally:
             data.close()
@@ -2931,6 +3074,7 @@ def main():
     parser.add_argument("-k", required=True, action="append", help="Track ID or 128-bit KID, followed by a 128-bit key, in the form ID:KEY")
     parser.add_argument("--show-tracks", action="store_true", help="Print detected tracks before decryption")
     parser.add_argument("--keep-text", action="store_true", help="Keep text/caption tracks instead of removing them from init metadata when supported")
+    parser.add_argument("-S", "--fix-sei", action="store_true", help="Fix missing rbsp_stop_one_bit in HEVC SEI when present")
     args = parser.parse_args()
 
     keys_by_track, keys_by_kid = parse_keys(args.k)
@@ -2946,7 +3090,7 @@ def main():
         )
         return
 
-    decrypt_mp4_file(args.i, args.o, keys_by_track, keys_by_kid, show_tracks=args.show_tracks, drop_text=not args.keep_text)
+    decrypt_mp4_file(args.i, args.o, keys_by_track, keys_by_kid, show_tracks=args.show_tracks, drop_text=not args.keep_text, fix_sei=args.fix_sei)
 
 if __name__ == "__main__":
     try:

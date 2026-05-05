@@ -2333,16 +2333,20 @@ def fp_parse_trun(data, box_start, box_end, box_header):
         sample = {}
         if flags & 0x000100:
             sample["duration"] = fp_be32(data, offset)
+            sample["duration_offset"] = offset
             offset += 4
         if flags & 0x000200:
             sample["size"] = fp_be32(data, offset)
+            sample["size_offset"] = offset
             offset += 4
         if flags & 0x000400:
             sample["flags"] = fp_be32(data, offset)
+            sample["flags_offset"] = offset
             offset += 4
         elif index == 0 and first_sample_flags is not None:
             sample["flags"] = first_sample_flags
         if flags & 0x000800:
+            sample["composition_time_offset_offset"] = offset
             if version == 0:
                 sample["composition_time_offset"] = fp_be32(data, offset)
             else:
@@ -2431,9 +2435,11 @@ def fp_collect_fragments(data, tracks):
         if box_type == "moof":
             next_header = fp_read_box_header(data, box_end, file_size)
             mdat_start = None
+            mdat_size_offset = None
             mdat_data_start = None
             if next_header is not None and next_header[3] == "mdat":
                 mdat_start = next_header[0]
+                mdat_size_offset = next_header[0]
                 mdat_data_start = next_header[0] + next_header[2]
             trafs = []
             for traf_start, traf_end, traf_header, traf_type in fp_children(data, box_start + box_header, box_end):
@@ -2476,7 +2482,8 @@ def fp_collect_fragments(data, tracks):
                             aux_index += 1
                             continue
                         sample_aux = senc_entries[aux_index]
-                        fragment_samples.append((sample_offset, sample_size, sample_aux, track_id))
+                        sample_size_offset = sample.get("size_offset")
+                        fragment_samples.append((sample_offset, sample_size, sample_aux, track_id, sample_size_offset, mdat_size_offset))
                         sample_offset += sample_size
                         aux_index += 1
                     fragments.extend(fragment_samples)
@@ -2623,10 +2630,163 @@ def fp_collect_decrypted_mp4_metadata_patches(data, tracks):
     return patches
 
 
+
+def fp_strip_hevc_emulation_prevention_with_map(payload):
+    rbsp = bytearray()
+    rbsp_to_ebsp = []
+    zero_count = 0
+    for index, value in enumerate(payload):
+        if zero_count >= 2 and value == 0x03:
+            zero_count = 0
+            continue
+        rbsp_to_ebsp.append(index)
+        rbsp.append(value)
+        if value == 0:
+            zero_count += 1
+        else:
+            zero_count = 0
+    return bytes(rbsp), rbsp_to_ebsp
+
+
+def fp_repair_hevc_sei_rbsp_stop(sample):
+    if len(sample) < 6:
+        return sample
+
+    nal_length_size = 4
+    cursor = 0
+    repaired = bytearray()
+    changed = False
+
+    while cursor < len(sample):
+        if cursor + nal_length_size > len(sample):
+            return sample
+
+        nal_size = int.from_bytes(sample[cursor:cursor + nal_length_size], "big")
+        nal_start = cursor + nal_length_size
+        nal_end = nal_start + nal_size
+
+        if nal_size <= 0 or nal_end > len(sample):
+            return sample
+
+        nal = bytearray(sample[nal_start:nal_end])
+
+        if len(nal) >= 4:
+            nal_type = (nal[0] >> 1) & 0x3F
+
+            if nal_type in (39, 40):
+                rbsp, rbsp_to_ebsp = fp_strip_hevc_emulation_prevention_with_map(nal[2:])
+                position = 0
+
+                while position + 2 <= len(rbsp):
+                    payload_type = 0
+                    while position < len(rbsp) and rbsp[position] == 0xFF:
+                        payload_type += 255
+                        position += 1
+
+                    if position >= len(rbsp):
+                        break
+
+                    payload_type += rbsp[position]
+                    position += 1
+
+                    payload_size = 0
+                    size_uses_ff = False
+                    payload_size_byte_position = position
+
+                    while position < len(rbsp) and rbsp[position] == 0xFF:
+                        payload_size += 255
+                        position += 1
+                        size_uses_ff = True
+
+                    if position >= len(rbsp):
+                        break
+
+                    payload_size_byte_position = position
+                    payload_size += rbsp[position]
+                    position += 1
+
+                    available_after_size = len(rbsp) - position
+                    payload_end = position + payload_size
+
+                    if payload_type == 4 and not size_uses_ff and 0 <= payload_size <= available_after_size:
+                        if payload_size == available_after_size:
+                            nal.append(0x80)
+                            nal_size += 1
+                            changed = True
+                            break
+
+                        trailing = rbsp[payload_end:]
+
+                        if len(trailing) == 1 and trailing[0] != 0x80:
+                            new_payload_size = payload_size + 1
+                            if new_payload_size <= 0xFE:
+                                size_ebsp_offset = rbsp_to_ebsp[payload_size_byte_position]
+                                nal[2 + size_ebsp_offset] = new_payload_size
+                                nal.append(0x80)
+                                nal_size += 1
+                                changed = True
+                                break
+
+                    if payload_end >= len(rbsp):
+                        break
+
+                    position = payload_end
+
+        repaired.extend(nal_size.to_bytes(nal_length_size, "big"))
+        repaired.extend(nal)
+        cursor = nal_end
+
+    if cursor != len(sample):
+        return sample
+
+    return bytes(repaired) if changed else sample
+
+
 def fp_decrypt_sample_to_bytes(data, sample_start, sample_size, sample_aux, track, key):
     sample = bytearray(data[sample_start:sample_start + sample_size])
     fp_decrypt_sample(sample, 0, sample_size, sample_aux, track, key)
-    return bytes(sample)
+    result = bytes(sample)
+    original_format = str(track.get("original_format") or track.get("entry_type") or "").lower()
+    if original_format in {"hev1", "hvc1", "dvhe", "dvh1"}:
+        result = fp_repair_hevc_sei_rbsp_stop(result)
+    return result
+
+
+def fp_collect_growth_patches(data, decrypt_events):
+    patches = []
+    trun_size_deltas = {}
+    mdat_size_deltas = {}
+    growth_count = 0
+
+    for event_start, event_end, event_kind, event_payload in decrypt_events:
+        sample_start, sample_size, sample_aux, track, key, sample_size_offset, mdat_size_offset = event_payload
+        decrypted = fp_decrypt_sample_to_bytes(data, sample_start, sample_size, sample_aux, track, key)
+        delta = len(decrypted) - sample_size
+        if delta <= 0:
+            continue
+        growth_count += 1
+        if sample_size_offset is not None:
+            trun_size_deltas[sample_size_offset] = trun_size_deltas.get(sample_size_offset, 0) + delta
+        if mdat_size_offset is not None:
+            mdat_size_deltas[mdat_size_offset] = mdat_size_deltas.get(mdat_size_offset, 0) + delta
+
+    for offset, delta in sorted(trun_size_deltas.items()):
+        old_value = fp_be32(data, offset)
+        new_value = old_value + delta
+        if new_value > 0xFFFFFFFF:
+            fail("Expanded HEVC sample size exceeds 32-bit trun storage")
+        patches.append((offset, struct.pack(">I", new_value)))
+
+    for offset, delta in sorted(mdat_size_deltas.items()):
+        old_value = fp_be32(data, offset)
+        if old_value == 1:
+            continue
+        new_value = old_value + delta
+        if new_value > 0xFFFFFFFF:
+            fail("Expanded mdat size exceeds 32-bit box storage")
+        patches.append((offset, struct.pack(">I", new_value)))
+
+    return patches, growth_count
 
 
 def fp_prepare_patch_events(patches):
@@ -2647,12 +2807,14 @@ def fp_prepare_patch_events(patches):
 
 def fp_prepare_decrypt_events(fragments, tracks, fast_keys):
     events = []
-    for sample_start, sample_size, sample_aux, track_id in fragments:
+    for fragment in fragments:
+        sample_start, sample_size, sample_aux, track_id, sample_size_offset, mdat_size_offset = fragment
         track = tracks[track_id]
         key = fast_keys.get(str(track_id)) or fast_keys.get(track["kid"]) or fast_keys.get("00000000000000000000000000000000")
         if key is None:
             fail(f"Missing key for KID {track['kid']}")
-        events.append((sample_start, sample_start + sample_size, "decrypt", (sample_start, sample_size, sample_aux, track, key)))
+        payload = (sample_start, sample_size, sample_aux, track, key, sample_size_offset, mdat_size_offset)
+        events.append((sample_start, sample_start + sample_size, "decrypt", payload))
     events.sort(key=lambda item: (item[0], item[1]))
     previous_end = -1
     for event in events:
@@ -2687,7 +2849,7 @@ def fp_stream_decrypt_to_output(data, output_path, patch_events, decrypt_events)
             if event_kind == "patch":
                 out_file.write(event_payload)
             else:
-                sample_start, sample_size, sample_aux, track, key = event_payload
+                sample_start, sample_size, sample_aux, track, key, sample_size_offset, mdat_size_offset = event_payload
                 out_file.write(fp_decrypt_sample_to_bytes(data, sample_start, sample_size, sample_aux, track, key))
                 processed += 1
                 ratio = processed / total_samples if total_samples else 1.0
@@ -2753,8 +2915,10 @@ def decrypt_mp4_file(input_path: str, output_path: str, keys_by_track: Dict[int,
             if drop_text:
                 patches.extend(fp_collect_text_track_patches(data))
             patches.extend(fp_collect_decrypted_mp4_metadata_patches(data, tracks))
-            patch_events = fp_prepare_patch_events(patches)
             decrypt_events = fp_prepare_decrypt_events(fragments, tracks, fast_keys)
+            growth_patches, repaired_sei_count = fp_collect_growth_patches(data, decrypt_events)
+            patches.extend(growth_patches)
+            patch_events = fp_prepare_patch_events(patches)
             fp_stream_decrypt_to_output(data, output_path, patch_events, decrypt_events)
             print("Decrypted successfully")
         finally:

@@ -2000,7 +2000,9 @@ def parse_keys(values: List[str]) -> Tuple[Dict[int, bytes], Dict[bytes, bytes]]
 
 
 
-FP_PROGRESS_WIDTH = 38
+FP_PROGRESS_WIDTH = 40
+FP_PIFF_SAMPLE_ENCRYPTION_UUID = "a2394f525a9b4f14a2446c427c648df4"
+FP_PIFF_TRACK_ENCRYPTION_UUID = "8974dbce7be74c5184f97148f9882554"
 
 
 def fp_be32(data, offset):
@@ -2028,9 +2030,23 @@ def fp_read_box_header(data, offset, limit):
         header = 16
     elif size == 0:
         size = limit - offset
+    if box_type == "uuid":
+        if offset + header + 16 > limit:
+            return None
+        header += 16
     if size < header or offset + size > limit:
         return None
     return offset, offset + size, header, box_type
+
+
+def fp_box_uuid(data, box_start, box_header, box_type):
+    if box_type != "uuid":
+        return ""
+    uuid_start = box_start + box_header - 16
+    uuid_end = box_start + box_header
+    if uuid_start < box_start + 8 or uuid_end > len(data):
+        return ""
+    return bytes(data[uuid_start:uuid_end]).hex()
 
 
 def fp_children(data, start, end):
@@ -2050,7 +2066,8 @@ def fp_recursive_boxes(data, start, end, wanted):
     while stack:
         current_start, current_end = stack.pop()
         for box_start, box_end, box_header, box_type in fp_children(data, current_start, current_end):
-            if box_type in wanted:
+            box_uuid = fp_box_uuid(data, box_start, box_header, box_type)
+            if box_type in wanted or (box_type == "uuid" and (("senc" in wanted and box_uuid == FP_PIFF_SAMPLE_ENCRYPTION_UUID) or ("tenc" in wanted and box_uuid == FP_PIFF_TRACK_ENCRYPTION_UUID))):
                 yield box_start, box_end, box_header, box_type
             if box_type in container_types:
                 stack.append((box_start + box_header, box_end))
@@ -2579,7 +2596,7 @@ def fp_collect_fragments(data, tracks):
                         tfhd = fp_parse_tfhd(data, child_start, child_end, child_header)
                     elif child_type == "trun":
                         truns.append(fp_parse_trun(data, child_start, child_end, child_header))
-                    elif child_type == "senc":
+                    elif child_type == "senc" or (child_type == "uuid" and fp_box_uuid(data, child_start, child_header, child_type) == FP_PIFF_SAMPLE_ENCRYPTION_UUID):
                         current_track = tracks.get(tfhd["track_id"]) if tfhd else None
                         if current_track:
                             senc_entries = fp_parse_senc(data, child_start, child_end, child_header, current_track["iv_size"], current_track["constant_iv"])
@@ -2743,7 +2760,8 @@ def fp_collect_decrypted_mp4_metadata_patches(data, tracks):
     for box_start, box_end, box_header, box_type in fp_recursive_boxes(data, 0, len(data), protection_boxes):
         if box_start + 8 <= len(data):
             patches.append((box_start + 4, b"free"))
-        if box_type == "senc":
+        is_sample_encryption_box = box_type == "senc" or (box_type == "uuid" and fp_box_uuid(data, box_start, box_header, box_type) == FP_PIFF_SAMPLE_ENCRYPTION_UUID)
+        if is_sample_encryption_box:
             fullbox_offset = box_start + box_header
             sample_count_offset = fullbox_offset + 4
             if sample_count_offset + 4 <= box_end:
@@ -3010,6 +3028,204 @@ def fp_stream_decrypt_to_output(data, output_path, patch_events, decrypt_events,
     print()
 
 
+
+def fp_make_box(box_type: bytes, payload: bytes = b"") -> bytes:
+    return struct.pack(">I4s", 8 + len(payload), box_type) + payload
+
+
+def fp_make_full_box(box_type: bytes, version: int, flags: int, payload: bytes = b"") -> bytes:
+    return fp_make_box(box_type, bytes([version & 0xFF]) + (flags & 0xFFFFFF).to_bytes(3, "big") + payload)
+
+
+def fp_compress_table_values(values: List[int]) -> List[Tuple[int, int]]:
+    entries: List[Tuple[int, int]] = []
+    for value in values:
+        if entries and entries[-1][1] == value:
+            entries[-1] = (entries[-1][0] + 1, value)
+        else:
+            entries.append((1, value))
+    return entries
+
+
+def fp_collect_all_fragment_samples(data) -> Dict[int, List[Tuple[int, int, int, int, int]]]:
+    moov_start = None
+    moov_end = None
+    for box_start, box_end, box_header, box_type in fp_children(data, 0, len(data)):
+        if box_type == "moov":
+            moov_start = box_start
+            moov_end = box_end
+            break
+    if moov_start is None:
+        return {}
+
+    tracks = fp_parse_moov(data, moov_start, moov_end)
+    samples_by_track: Dict[int, List[Tuple[int, int, int, int, int]]] = {}
+
+    offset = 0
+    file_size = len(data)
+    while offset < file_size:
+        header = fp_read_box_header(data, offset, file_size)
+        if header is None:
+            break
+        box_start, box_end, box_header, box_type = header
+        if box_type != "moof":
+            offset = box_end
+            continue
+
+        next_header = fp_read_box_header(data, box_end, file_size)
+        mdat_data_start = None
+        if next_header is not None and next_header[3] == "mdat":
+            mdat_data_start = next_header[0] + next_header[2]
+
+        for traf_start, traf_end, traf_header, traf_type in fp_children(data, box_start + box_header, box_end):
+            if traf_type != "traf":
+                continue
+            tfhd = None
+            truns = []
+            for child_start, child_end, child_header, child_type in fp_children(data, traf_start + traf_header, traf_end):
+                if child_type == "tfhd":
+                    tfhd = fp_parse_tfhd(data, child_start, child_end, child_header)
+                elif child_type == "trun":
+                    truns.append(fp_parse_trun(data, child_start, child_end, child_header))
+            if not tfhd or not truns:
+                continue
+            track_id = tfhd["track_id"]
+            track = tracks.get(track_id, {})
+            trex = track.get("trex", {})
+            default_duration = tfhd.get("default_sample_duration", trex.get("default_sample_duration", 0))
+            default_size = tfhd.get("default_sample_size", trex.get("default_sample_size", 0))
+            default_flags = tfhd.get("default_sample_flags", trex.get("default_sample_flags", 0))
+            base = tfhd.get("base_data_offset", box_start)
+            samples_by_track.setdefault(track_id, [])
+            for sample_count, data_offset, samples in truns:
+                sample_offset = base + data_offset if data_offset is not None else mdat_data_start
+                if sample_offset is None:
+                    continue
+                first_flags = None
+                for index, sample in enumerate(samples):
+                    sample_size = sample.get("size", default_size)
+                    sample_duration = sample.get("duration", default_duration)
+                    sample_flags = sample.get("flags", first_flags if index == 0 and first_flags is not None else default_flags)
+                    sample_cto = sample.get("composition_time_offset", 0)
+                    if sample_size > 0:
+                        samples_by_track[track_id].append((sample_offset, sample_size, sample_duration, sample_cto, sample_flags))
+                    sample_offset += sample_size
+        offset = box_end
+
+    return samples_by_track
+
+
+def fp_patch_duration_in_box(raw: bytes, box_type: bytes, duration: int) -> bytes:
+    out = bytearray(raw)
+    if len(out) < 16:
+        return bytes(out)
+    version = out[8]
+    if version == 1:
+        duration_offset = 36 if box_type == b"tkhd" else 32
+        if duration_offset + 8 <= len(out):
+            struct.pack_into(">Q", out, duration_offset, duration & 0xFFFFFFFFFFFFFFFF)
+    else:
+        duration_offset = 28 if box_type == b"tkhd" else 24
+        if duration_offset + 4 <= len(out):
+            struct.pack_into(">I", out, duration_offset, duration & 0xFFFFFFFF)
+    return bytes(out)
+
+
+def fp_build_flat_sample_table(original_stsd: bytes, samples: List[Tuple[int, int, int, int, int]], chunk_offset: int) -> bytes:
+    durations = [sample[2] for sample in samples]
+    composition_offsets = [sample[3] for sample in samples]
+    sizes = [sample[1] for sample in samples]
+    flags = [sample[4] for sample in samples]
+
+    stts_entries = fp_compress_table_values(durations)
+    stts_payload = struct.pack(">I", len(stts_entries)) + b"".join(struct.pack(">II", count, value) for count, value in stts_entries)
+    stts = fp_make_full_box(b"stts", 0, 0, stts_payload)
+
+    ctts_entries = fp_compress_table_values(composition_offsets)
+    ctts_payload = struct.pack(">I", len(ctts_entries)) + b"".join(struct.pack(">II", count, value) for count, value in ctts_entries)
+    ctts = fp_make_full_box(b"ctts", 0, 0, ctts_payload)
+
+    stsc = fp_make_full_box(b"stsc", 0, 0, struct.pack(">IIII", 1, 1, len(samples), 1))
+    stsz = fp_make_full_box(b"stsz", 0, 0, struct.pack(">II", 0, len(samples)) + b"".join(struct.pack(">I", size) for size in sizes))
+    stco = fp_make_full_box(b"stco", 0, 0, struct.pack(">II", 1, chunk_offset & 0xFFFFFFFF))
+
+    sync_samples = [index + 1 for index, sample_flags in enumerate(flags) if not (sample_flags & 0x00010000)]
+    stss = fp_make_full_box(b"stss", 0, 0, struct.pack(">I", len(sync_samples)) + b"".join(struct.pack(">I", index) for index in sync_samples))
+
+    return fp_make_box(b"stbl", original_stsd + stts + ctts + stsc + stsz + stco + stss)
+
+
+def fp_flatten_fragmented_mp4_in_place(file_path: str):
+    with open(file_path, "rb") as file_handle:
+        source = file_handle.read()
+
+    parser = Mp4Parser(source)
+    moov = None
+    ftyp = None
+    for top in parser.root:
+        if top.type == b"ftyp":
+            ftyp = top
+        elif top.type == b"moov":
+            moov = top
+    if ftyp is None or moov is None:
+        return
+
+    samples_by_track = fp_collect_all_fragment_samples(source)
+    if not samples_by_track:
+        return
+
+    primary_track_id = sorted(samples_by_track, key=lambda track_id: len(samples_by_track[track_id]), reverse=True)[0]
+    primary_samples = samples_by_track[primary_track_id]
+    if not primary_samples:
+        return
+
+    total_duration = sum(sample[2] for sample in primary_samples)
+
+    def rebuild(current: Box, stco_offset: int) -> bytes:
+        if current.type == b"mvex":
+            return b""
+        if current.type == b"stbl":
+            stsd = None
+            for child in current.children:
+                if child.type == b"stsd":
+                    stsd = child
+                    break
+            if stsd is None:
+                return source[current.start:current.end]
+            return fp_build_flat_sample_table(source[stsd.start:stsd.end], primary_samples, stco_offset)
+        if current.children:
+            payload_start = current.start + current.header_size
+            payload = bytearray()
+            position = payload_start
+            for child in current.children:
+                if position < child.start:
+                    payload.extend(source[position:child.start])
+                payload.extend(rebuild(child, stco_offset))
+                position = child.end
+            if position < current.end:
+                payload.extend(source[position:current.end])
+            return fp_make_box(current.type, bytes(payload))
+        raw = source[current.start:current.end]
+        if current.type in {b"mvhd", b"tkhd", b"mdhd"}:
+            return fp_patch_duration_in_box(raw, current.type, total_duration)
+        return raw
+
+    stco_offset = 0
+    new_moov = b""
+    for _ in range(4):
+        new_moov = rebuild(moov, stco_offset)
+        stco_offset = (ftyp.end - ftyp.start) + len(new_moov) + 8
+
+    mdat_payload = bytearray()
+    for sample_offset, sample_size, _, _, _ in primary_samples:
+        mdat_payload.extend(source[sample_offset:sample_offset + sample_size])
+
+    flattened = source[ftyp.start:ftyp.end] + new_moov + fp_make_box(b"mdat", bytes(mdat_payload))
+    temp_path = file_path + ".flat.tmp"
+    with open(temp_path, "wb") as file_handle:
+        file_handle.write(flattened)
+    os.replace(temp_path, file_path)
+
 def decrypt_mp4_file(input_path: str, output_path: str, keys_by_track: Dict[int, bytes], keys_by_kid: Dict[bytes, bytes], show_tracks: bool = False, drop_text: bool = True, fix_sei: bool = False):
     if not os.path.isfile(input_path):
         fail("Input file does not exist")
@@ -3063,6 +3279,7 @@ def decrypt_mp4_file(input_path: str, output_path: str, keys_by_track: Dict[int,
             patches.extend(growth_patches)
             patch_events = fp_prepare_patch_events(patches)
             fp_stream_decrypt_to_output(data, output_path, patch_events, decrypt_events, fix_sei=fix_sei)
+            fp_flatten_fragmented_mp4_in_place(output_path)
             print("Decrypted successfully")
         finally:
             data.close()

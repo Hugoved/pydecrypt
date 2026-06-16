@@ -4,6 +4,7 @@ import os
 import struct
 import sys
 import time
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -3388,7 +3389,6 @@ def fp_build_flat_sample_table(original_stsd: bytes, samples: List[Tuple[int, in
 
     return fp_make_box(b"stbl", original_stsd + stts + ctts + stsc + stsz + stco + stss)
 
-
 def fp_collect_all_fragment_sample_chunks(data) -> Dict[int, List[List[Tuple[int, int, int, int, int]]]]:
     moov_start = None
     moov_end = None
@@ -3659,7 +3659,11 @@ def fp_flatten_fragmented_mp4_chunked_compat(file_path: str, source: bytes, pars
     temp_path = file_path + ".flat.tmp"
     with open(temp_path, "wb") as file_handle:
         file_handle.write(flattened)
-    os.replace(temp_path, file_path) 
+    os.replace(temp_path, file_path)
+    print(
+        "Detected fragmented HEVC layout with dense moof/mdat boundaries; "
+        f"using v3 chunked compatibility flatten ({len(primary_chunks)} chunks, {expected_sample_count} samples)."
+    )
     return True
 
 def fp_flatten_fragmented_mp4_in_place(file_path: str):
@@ -3691,7 +3695,7 @@ def fp_flatten_fragmented_mp4_in_place(file_path: str):
     if fp_should_use_v3_chunked_flatten(source, parser, moov, primary_track_id, primary_samples, primary_chunks):
         if fp_flatten_fragmented_mp4_chunked_compat(file_path, source, parser, ftyp, moov, primary_track_id, primary_chunks):
             return
-
+        
     moof_count = sum(1 for _, _, _, box_type in fp_children(source, 0, len(source)) if box_type == "moof")
     last_sample_end = max(sample_offset + sample_size for sample_offset, sample_size, _, _, _ in primary_samples)
     if moof_count > 1 and last_sample_end < int(len(source) * 0.75):
@@ -3749,6 +3753,809 @@ def fp_flatten_fragmented_mp4_in_place(file_path: str):
         file_handle.write(flattened)
     os.replace(temp_path, file_path)
 
+FP_V4_STREAM_FILE_SIZE_THRESHOLD = 1024 * 1024 * 1024
+FP_V4_STREAM_MOOF_THRESHOLD = 4096
+FP_V4_STREAM_DURATION_THRESHOLD_SECONDS = 2 * 60 * 60
+FP_V4_MAX_PATCHED_BOX_BYTES = 128 * 1024 * 1024
+FP_V4_COPY_CHUNK = 4 * 1024 * 1024
+
+
+def fp_stream_copy_file_range(file_handle, out_file, start: int, end: int, progress: Optional[ProgressPrinter] = None, chunk_size: int = FP_V4_COPY_CHUNK):
+    if end < start:
+        raise ValueError("Invalid copy range")
+    file_handle.seek(start)
+    remaining = end - start
+    position = start
+    while remaining > 0:
+        take = min(chunk_size, remaining)
+        chunk = file_handle.read(take)
+        if not chunk:
+            raise IOError("Unexpected EOF while copying input range")
+        out_file.write(chunk)
+        position += len(chunk)
+        remaining -= len(chunk)
+        if progress:
+            progress.update(position)
+
+
+def fp_read_exact_range(file_handle, start: int, size: int) -> bytes:
+    if size < 0:
+        raise ValueError("Invalid read size")
+    file_handle.seek(start)
+    chunks = []
+    remaining = size
+    while remaining > 0:
+        chunk = file_handle.read(min(FP_V4_COPY_CHUNK, remaining))
+        if not chunk:
+            raise IOError("Unexpected EOF while reading encrypted sample")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if len(chunks) == 1:
+        return chunks[0]
+    return b"".join(chunks)
+
+
+def fp_decrypt_sample_to_bytes_from_file(file_handle, sample_start, sample_size, sample_aux, track, key, fix_sei=False):
+    sample = bytearray(fp_read_exact_range(file_handle, sample_start, sample_size))
+    fp_decrypt_sample(sample, 0, sample_size, sample_aux, track, key)
+    result = bytes(sample)
+    if fix_sei and fp_track_uses_hevc_bitstream(track):
+        result = fp_repair_hevc_sei_rbsp_stop(result)
+    return result
+
+
+def fp_madvise_dontneed(data, start: int, end: int):
+    madvise = getattr(data, "madvise", None)
+    dontneed = getattr(mmap, "MADV_DONTNEED", None)
+    if madvise is None or dontneed is None or end <= start:
+        return
+    try:
+        madvise(dontneed, start, end - start)
+    except (OSError, ValueError):
+        pass
+
+
+def fp_apply_absolute_patches_to_blob(blob: bytearray, blob_start: int, patches):
+    for patch in patches:
+        if len(patch) == 4:
+            position, payload = patch[0], patch[3]
+        else:
+            position, payload = patch
+        if not payload:
+            continue
+        local = position - blob_start
+        if local < 0 or local + len(payload) > len(blob):
+            continue
+        blob[local:local + len(payload)] = payload
+
+
+def fp_write_patched_box_range(data, out_file, start: int, end: int, patches: List[Tuple[int, bytes]], progress: Optional[ProgressPrinter] = None):
+    if end < start:
+        raise ValueError("Invalid patched range")
+    size = end - start
+    if size > FP_V4_MAX_PATCHED_BOX_BYTES:
+        fail(f"Refusing to buffer an unexpectedly large metadata box of {size} bytes in v4 streaming path")
+    blob = bytearray(data[start:end])
+    fp_apply_absolute_patches_to_blob(blob, start, patches)
+    out_file.write(blob)
+    if progress:
+        progress.update(end)
+
+
+def fp_collect_decrypted_mp4_metadata_patches_for_moov(data, tracks, moov_start: int, moov_end: int) -> List[Tuple[int, bytes]]:
+    patches: List[Tuple[int, bytes]] = []
+    for track_id in sorted(tracks):
+        track = tracks[track_id]
+        if fp_is_text_or_caption_track(track):
+            continue
+        if not track.get("encrypted"):
+            continue
+        original_format = track.get("original_format") or ""
+        sample_entry_start = track.get("sample_entry_start")
+        if original_format and sample_entry_start is not None and moov_start <= sample_entry_start and sample_entry_start + 8 <= moov_end:
+            patches.append((sample_entry_start + 4, original_format.encode("latin1")[:4]))
+        tenc_is_protected_offset = track.get("tenc_is_protected_offset")
+        tenc_iv_size_offset = track.get("tenc_iv_size_offset")
+        if tenc_is_protected_offset is not None and moov_start <= tenc_is_protected_offset < moov_end:
+            patches.append((tenc_is_protected_offset, b"\x00"))
+        if tenc_iv_size_offset is not None and moov_start <= tenc_iv_size_offset < moov_end:
+            patches.append((tenc_iv_size_offset, b"\x00"))
+
+    protection_boxes = {"sinf", "schm", "schi", "tenc", "senc", "saiz", "saio", "pssh"}
+    for box_start, box_end, box_header, box_type in fp_recursive_boxes(data, moov_start + 8, moov_end, protection_boxes):
+        if box_start + 8 <= moov_end:
+            patches.append((box_start + 4, b"free"))
+        is_sample_encryption_box = box_type == "senc" or (box_type == "uuid" and fp_box_uuid(data, box_start, box_header, box_type) == FP_PIFF_SAMPLE_ENCRYPTION_UUID)
+        if is_sample_encryption_box:
+            fullbox_offset = box_start + box_header
+            sample_count_offset = fullbox_offset + 4
+            if sample_count_offset + 4 <= box_end:
+                patches.append((fullbox_offset + 1, b"\x00\x00\x00"))
+                patches.append((sample_count_offset, b"\x00\x00\x00\x00"))
+        elif box_type in {"saiz", "saio", "tenc", "schm"}:
+            fullbox_offset = box_start + box_header
+            if fullbox_offset + 4 <= box_end:
+                patches.append((fullbox_offset + 1, b"\x00\x00\x00"))
+    return patches
+
+
+def fp_collect_fragment_metadata_patches_for_range(data, range_start: int, range_end: int) -> List[Tuple[int, bytes]]:
+    patches: List[Tuple[int, bytes]] = []
+    protection_boxes = {"senc", "saiz", "saio", "pssh"}
+    for box_start, box_end, box_header, box_type in fp_recursive_boxes(data, range_start, range_end, protection_boxes):
+        if box_start + 8 <= range_end:
+            patches.append((box_start + 4, b"free"))
+        is_sample_encryption_box = box_type == "senc" or (box_type == "uuid" and fp_box_uuid(data, box_start, box_header, box_type) == FP_PIFF_SAMPLE_ENCRYPTION_UUID)
+        if is_sample_encryption_box:
+            fullbox_offset = box_start + box_header
+            sample_count_offset = fullbox_offset + 4
+            if sample_count_offset + 4 <= box_end:
+                patches.append((fullbox_offset + 1, b"\x00\x00\x00"))
+                patches.append((sample_count_offset, b"\x00\x00\x00\x00"))
+        elif box_type in {"saiz", "saio"}:
+            fullbox_offset = box_start + box_header
+            if fullbox_offset + 4 <= box_end:
+                patches.append((fullbox_offset + 1, b"\x00\x00\x00"))
+    return patches
+
+
+def fp_collect_top_level_box_metadata_patches(data, box_start: int, box_end: int, box_type: str) -> List[Tuple[int, bytes]]:
+    if box_type == "pssh" and box_start + 8 <= box_end:
+        return [(box_start + 4, b"free")]
+    return []
+
+
+def fp_get_mvhd_duration_seconds(data, moov_start: int, moov_end: int) -> float:
+    for box_start, box_end, box_header, box_type in fp_children(data, moov_start + 8, moov_end):
+        if box_type != "mvhd":
+            continue
+        if box_start + box_header + 24 > box_end:
+            return 0.0
+        version, flags = fp_parse_fullbox(data, box_start, box_header)
+        offset = box_start + box_header + 4
+        if version == 1:
+            if offset + 28 > box_end:
+                return 0.0
+            timescale = fp_be32(data, offset + 16)
+            duration = fp_be64(data, offset + 20)
+        else:
+            if offset + 16 > box_end:
+                return 0.0
+            timescale = fp_be32(data, offset + 8)
+            duration = fp_be32(data, offset + 12)
+        if timescale <= 0:
+            return 0.0
+        return duration / timescale
+    return 0.0
+
+
+def fp_should_use_v4_large_streaming(data, moov_start: int, moov_end: int) -> Tuple[bool, str]:
+    file_size = len(data)
+    if file_size >= FP_V4_STREAM_FILE_SIZE_THRESHOLD:
+        return True, f"file size {file_size} bytes"
+    moof_count = fp_count_top_level_boxes(data, "moof")
+    if moof_count >= FP_V4_STREAM_MOOF_THRESHOLD:
+        return True, f"{moof_count} moof fragments"
+    duration_seconds = fp_get_mvhd_duration_seconds(data, moov_start, moov_end)
+    if duration_seconds >= FP_V4_STREAM_DURATION_THRESHOLD_SECONDS and moof_count > 1:
+        return True, f"duration {duration_seconds:.3f}s across {moof_count} moof fragments"
+    return False, ""
+
+
+def fp_collect_fragments_for_single_moof(data, tracks, moof_start: int, moof_end: int, moof_header: int, next_header):
+    fragments = []
+    file_size = len(data)
+    mdat_size_offset = None
+    mdat_data_start = None
+    if next_header is not None and next_header[3] == "mdat":
+        mdat_size_offset = next_header[0]
+        mdat_data_start = next_header[0] + next_header[2]
+
+    for traf_start, traf_end, traf_header, traf_type in fp_children(data, moof_start + moof_header, moof_end):
+        if traf_type != "traf":
+            continue
+        tfhd = None
+        trun_boxes = []
+        senc_box = None
+        saiz_box = None
+        saio_box = None
+        for child_start, child_end, child_header, child_type in fp_children(data, traf_start + traf_header, traf_end):
+            child_uuid = fp_box_uuid(data, child_start, child_header, child_type)
+            if child_type == "tfhd":
+                tfhd = fp_parse_tfhd(data, child_start, child_end, child_header)
+            elif child_type == "trun":
+                trun_boxes.append((child_start, child_end, child_header))
+            elif child_type == "senc" or (child_type == "uuid" and child_uuid == FP_PIFF_SAMPLE_ENCRYPTION_UUID):
+                senc_box = (child_start, child_end, child_header)
+            elif child_type == "saiz":
+                saiz_box = (child_start, child_end, child_header)
+            elif child_type == "saio":
+                saio_box = (child_start, child_end, child_header)
+
+        if not tfhd or not trun_boxes:
+            continue
+        track_id = tfhd["track_id"]
+        track = tracks.get(track_id)
+        if not track or not track.get("encrypted"):
+            continue
+
+        senc_entries = None
+        if senc_box is not None:
+            senc_entries = fp_parse_senc(data, senc_box[0], senc_box[1], senc_box[2], track["iv_size"], track["constant_iv"])
+        elif saiz_box is not None and saio_box is not None:
+            sample_info_sizes = fp_parse_saiz_fast(data, saiz_box[0], saiz_box[1], saiz_box[2])
+            aux_offsets = fp_parse_saio_fast(data, saio_box[0], saio_box[1], saio_box[2])
+            senc_entries = fp_parse_aux_info_from_saiz_saio_fast(
+                data,
+                sample_info_sizes,
+                aux_offsets,
+                track["iv_size"],
+                track["constant_iv"],
+                offset_base=moof_start,
+            )
+        if not senc_entries:
+            continue
+
+        trex = track.get("trex", {})
+        default_sample_size = tfhd.get("default_sample_size", trex.get("default_sample_size", 0))
+        base = tfhd.get("base_data_offset", moof_start)
+        aux_index = 0
+        previous_sample_end = None
+        for trun_start, trun_end, trun_header in trun_boxes:
+            sample_count, data_offset, samples = fp_parse_trun(data, trun_start, trun_end, trun_header)
+            if data_offset is not None:
+                sample_offset = base + data_offset
+            elif previous_sample_end is not None:
+                sample_offset = previous_sample_end
+            elif mdat_data_start is not None:
+                sample_offset = mdat_data_start
+            else:
+                sample_offset = base
+            for sample in samples:
+                sample_size = sample.get("size", default_sample_size)
+                if sample_size <= 0:
+                    aux_index += 1
+                    continue
+                if aux_index >= len(senc_entries):
+                    sample_offset += sample_size
+                    aux_index += 1
+                    continue
+                sample_aux = senc_entries[aux_index]
+                sample_size_offset = sample.get("size_offset")
+                if 0 <= sample_offset and sample_offset + sample_size <= file_size:
+                    fragments.append((sample_offset, sample_size, sample_aux, track_id, sample_size_offset, mdat_size_offset))
+                sample_offset += sample_size
+                previous_sample_end = sample_offset
+                aux_index += 1
+    fragments.sort(key=lambda item: (item[0], item[1]))
+    return fragments
+
+
+def fp_stream_write_range_with_events(file_handle, data, out_file, start: int, end: int, events, progress: Optional[ProgressPrinter] = None, fix_sei: bool = False) -> int:
+    events = [event for event in events if start <= event[0] and event[1] <= end]
+    events.sort(key=lambda item: (item[0], 0 if item[2] == "patch" else 1, item[1]))
+    previous_end = start
+    for event in events:
+        if event[0] < previous_end:
+            fail("Overlapping stream events were generated in v4 streaming path")
+        previous_end = event[1]
+
+    cursor = start
+    processed = 0
+    for event_start, event_end, event_kind, event_payload in events:
+        if cursor < event_start:
+            fp_stream_copy_file_range(file_handle, out_file, cursor, event_start, progress)
+        if event_kind == "patch":
+            out_file.write(event_payload)
+            if progress:
+                progress.update(event_end)
+        else:
+            sample_start, sample_size, sample_aux, track, key, sample_size_offset, mdat_size_offset = event_payload
+            out_file.write(fp_decrypt_sample_to_bytes_from_file(file_handle, sample_start, sample_size, sample_aux, track, key, fix_sei=fix_sei))
+            processed += 1
+            if progress:
+                progress.update(event_end)
+        cursor = event_end
+    if cursor < end:
+        fp_stream_copy_file_range(file_handle, out_file, cursor, end, progress)
+    return processed
+
+
+
+
+def fp_make_box_header(box_type: bytes, payload_size: int) -> bytes:
+    total_size = payload_size + 8
+    if total_size <= 0xFFFFFFFF:
+        return struct.pack(">I4s", total_size, box_type)
+    return struct.pack(">I4sQ", 1, box_type, payload_size + 16)
+
+
+def fp_write_u32(file_handle, value: int):
+    file_handle.write(struct.pack(">I", value & 0xFFFFFFFF))
+
+
+def fp_iter_u32_file(path: str, count: int):
+    with open(path, "rb") as file_handle:
+        for _ in range(count):
+            raw = file_handle.read(4)
+            if len(raw) != 4:
+                raise IOError("Unexpected EOF while reading temporary sample table")
+            yield struct.unpack(">I", raw)[0]
+
+
+def fp_compress_u32_file(path: str, count: int, last_delta: int = 0) -> List[Tuple[int, int]]:
+    entries: List[Tuple[int, int]] = []
+    for index, value in enumerate(fp_iter_u32_file(path, count)):
+        if index == count - 1 and last_delta:
+            value = (value + last_delta) & 0xFFFFFFFF
+        if entries and entries[-1][1] == value:
+            entries[-1] = (entries[-1][0] + 1, value)
+        else:
+            entries.append((1, value))
+    return entries
+
+
+def fp_choose_v4_primary_track(tracks) -> Optional[int]:
+    for track_id in sorted(tracks):
+        track = tracks[track_id]
+        if track.get("encrypted") and str(track.get("handler", "")).lower() == "vide" and not fp_is_text_or_caption_track(track):
+            return track_id
+    for track_id in sorted(tracks):
+        track = tracks[track_id]
+        if track.get("encrypted") and not fp_is_text_or_caption_track(track):
+            return track_id
+    return None
+
+
+def fp_resolve_v4_fast_key(track_id: int, track, fast_keys):
+    key = fast_keys.get(str(track_id)) or fast_keys.get(track.get("kid", "")) or fast_keys.get("00000000000000000000000000000000")
+    if key is None:
+        fail(f"Missing key for KID {track.get('kid', '-')}")
+    return key
+
+
+def fp_collect_sample_records_for_single_moof(data, tracks, primary_track_id: int, moof_start: int, moof_end: int, moof_header: int, next_header):
+    records = []
+    file_size = len(data)
+    mdat_data_start = None
+    if next_header is not None and next_header[3] == "mdat":
+        mdat_data_start = next_header[0] + next_header[2]
+
+    for traf_start, traf_end, traf_header, traf_type in fp_children(data, moof_start + moof_header, moof_end):
+        if traf_type != "traf":
+            continue
+        tfhd = None
+        trun_boxes = []
+        senc_box = None
+        saiz_box = None
+        saio_box = None
+        for child_start, child_end, child_header, child_type in fp_children(data, traf_start + traf_header, traf_end):
+            child_uuid = fp_box_uuid(data, child_start, child_header, child_type)
+            if child_type == "tfhd":
+                tfhd = fp_parse_tfhd(data, child_start, child_end, child_header)
+            elif child_type == "trun":
+                trun_boxes.append((child_start, child_end, child_header))
+            elif child_type == "senc" or (child_type == "uuid" and child_uuid == FP_PIFF_SAMPLE_ENCRYPTION_UUID):
+                senc_box = (child_start, child_end, child_header)
+            elif child_type == "saiz":
+                saiz_box = (child_start, child_end, child_header)
+            elif child_type == "saio":
+                saio_box = (child_start, child_end, child_header)
+        if not tfhd or not trun_boxes or tfhd["track_id"] != primary_track_id:
+            continue
+        track = tracks.get(primary_track_id)
+        if not track or not track.get("encrypted"):
+            continue
+        if senc_box is not None:
+            senc_entries = fp_parse_senc(data, senc_box[0], senc_box[1], senc_box[2], track["iv_size"], track["constant_iv"])
+        elif saiz_box is not None and saio_box is not None:
+            sample_info_sizes = fp_parse_saiz_fast(data, saiz_box[0], saiz_box[1], saiz_box[2])
+            aux_offsets = fp_parse_saio_fast(data, saio_box[0], saio_box[1], saio_box[2])
+            senc_entries = fp_parse_aux_info_from_saiz_saio_fast(
+                data,
+                sample_info_sizes,
+                aux_offsets,
+                track["iv_size"],
+                track["constant_iv"],
+                offset_base=moof_start,
+            )
+        else:
+            senc_entries = []
+        if not senc_entries:
+            continue
+
+        trex = track.get("trex", {})
+        default_sample_size = tfhd.get("default_sample_size", trex.get("default_sample_size", 0))
+        default_sample_duration = tfhd.get("default_sample_duration", trex.get("default_sample_duration", 0))
+        default_sample_flags = tfhd.get("default_sample_flags", trex.get("default_sample_flags", 0))
+        base = tfhd.get("base_data_offset", moof_start)
+        previous_sample_end = None
+        aux_index = 0
+        for trun_start, trun_end, trun_header in trun_boxes:
+            sample_count, data_offset, samples = fp_parse_trun(data, trun_start, trun_end, trun_header)
+            if data_offset is not None:
+                sample_offset = base + data_offset
+            elif previous_sample_end is not None:
+                sample_offset = previous_sample_end
+            elif mdat_data_start is not None:
+                sample_offset = mdat_data_start
+            else:
+                sample_offset = base
+            chunk_records = []
+            for sample in samples:
+                sample_size = sample.get("size", default_sample_size)
+                sample_duration = sample.get("duration", default_sample_duration)
+                sample_cto = sample.get("composition_time_offset", 0)
+                sample_flags = sample.get("flags", default_sample_flags)
+                if sample_size <= 0:
+                    aux_index += 1
+                    continue
+                if aux_index >= len(senc_entries):
+                    sample_offset += sample_size
+                    aux_index += 1
+                    continue
+                sample_aux = senc_entries[aux_index]
+                if 0 <= sample_offset and sample_offset + sample_size <= file_size:
+                    chunk_records.append((sample_offset, sample_size, sample_aux, primary_track_id, sample_duration, sample_cto, sample_flags))
+                sample_offset += sample_size
+                previous_sample_end = sample_offset
+                aux_index += 1
+            if chunk_records:
+                records.append(chunk_records)
+    return records
+
+
+def fp_build_chunked_sample_table_from_temp(original_stsd: bytes, table_paths: Dict[str, str], sample_count: int, chunk_sample_counts: List[int], chunk_offsets: List[int], target_duration: Optional[int], total_duration: int) -> bytes:
+    duration_delta = 0
+    if target_duration is not None and sample_count > 0:
+        candidate_delta = target_duration - total_duration
+        if 0 < candidate_delta <= 1000000000:
+            duration_delta = candidate_delta
+
+    stts_entries = fp_compress_u32_file(table_paths["durations"], sample_count, last_delta=duration_delta)
+    stts_payload = struct.pack(">I", len(stts_entries)) + b"".join(struct.pack(">II", count, value) for count, value in stts_entries)
+    stts = fp_make_full_box(b"stts", 0, 0, stts_payload)
+
+    ctts_entries = fp_compress_u32_file(table_paths["ctos"], sample_count)
+    ctts_payload = struct.pack(">I", len(ctts_entries)) + b"".join(struct.pack(">II", count, value) for count, value in ctts_entries)
+    ctts = fp_make_full_box(b"ctts", 0, 0, ctts_payload)
+
+    stsc_entries: List[Tuple[int, int, int]] = []
+    previous_samples_per_chunk = None
+    for chunk_index, samples_per_chunk in enumerate(chunk_sample_counts, 1):
+        if samples_per_chunk <= 0:
+            continue
+        if samples_per_chunk != previous_samples_per_chunk:
+            stsc_entries.append((chunk_index, samples_per_chunk, 1))
+            previous_samples_per_chunk = samples_per_chunk
+    stsc_payload = struct.pack(">I", len(stsc_entries)) + b"".join(struct.pack(">III", *entry) for entry in stsc_entries)
+    stsc = fp_make_full_box(b"stsc", 0, 0, stsc_payload)
+
+    stsz_payload = bytearray(struct.pack(">II", 0, sample_count))
+    for size in fp_iter_u32_file(table_paths["sizes"], sample_count):
+        stsz_payload.extend(struct.pack(">I", size))
+    stsz = fp_make_full_box(b"stsz", 0, 0, bytes(stsz_payload))
+
+    if chunk_offsets and max(chunk_offsets) > 0xFFFFFFFF:
+        chunk_table_payload = struct.pack(">I", len(chunk_offsets)) + b"".join(struct.pack(">Q", offset) for offset in chunk_offsets)
+        chunk_table = fp_make_full_box(b"co64", 0, 0, chunk_table_payload)
+    else:
+        chunk_table_payload = struct.pack(">I", len(chunk_offsets)) + b"".join(struct.pack(">I", offset & 0xFFFFFFFF) for offset in chunk_offsets)
+        chunk_table = fp_make_full_box(b"stco", 0, 0, chunk_table_payload)
+
+    sync_samples = []
+    sdtp_payload = bytearray()
+    for index, sample_flags in enumerate(fp_iter_u32_file(table_paths["flags"], sample_count), 1):
+        if not (sample_flags & 0x00010000):
+            sync_samples.append(index)
+        sample_depends_on = (sample_flags >> 24) & 0x03
+        sample_is_depended_on = (sample_flags >> 22) & 0x03
+        sample_has_redundancy = (sample_flags >> 20) & 0x03
+        sdtp_payload.append((sample_depends_on << 4) | (sample_is_depended_on << 2) | sample_has_redundancy)
+    stss = fp_make_full_box(b"stss", 0, 0, struct.pack(">I", len(sync_samples)) + b"".join(struct.pack(">I", index) for index in sync_samples))
+    sdtp = fp_make_full_box(b"sdtp", 0, 0, bytes(sdtp_payload))
+
+    return fp_make_box(b"stbl", original_stsd + stts + ctts + stsc + stsz + chunk_table + stss + sdtp)
+
+
+def fp_rebuild_moov_for_v4_stream_flatten(moov_blob: bytes, table_paths: Dict[str, str], sample_count: int, chunk_sample_counts: List[int], chunk_offsets: List[int], target_duration: Optional[int], total_duration: int) -> bytes:
+    moov_parser = Mp4Parser(moov_blob)
+    moov_box = None
+    for top in moov_parser.root:
+        if top.type == b"moov":
+            moov_box = top
+            break
+    if moov_box is None:
+        fail("No moov box found while rebuilding v4 streaming output")
+
+    def rebuild(current: Box) -> bytes:
+        if current.type == b"mvex":
+            return b""
+        if current.type == b"stbl":
+            stsd = None
+            for child in current.children:
+                if child.type == b"stsd":
+                    stsd = child
+                    break
+            if stsd is None:
+                return moov_blob[current.start:current.end]
+            return fp_build_chunked_sample_table_from_temp(
+                moov_blob[stsd.start:stsd.end],
+                table_paths,
+                sample_count,
+                chunk_sample_counts,
+                chunk_offsets,
+                target_duration,
+                total_duration,
+            )
+        if current.children:
+            payload_start = current.start + current.header_size
+            payload = bytearray()
+            position = payload_start
+            for child in current.children:
+                if position < child.start:
+                    payload.extend(moov_blob[position:child.start])
+                payload.extend(rebuild(child))
+                position = child.end
+            if position < current.end:
+                payload.extend(moov_blob[position:current.end])
+            return fp_make_box(current.type, bytes(payload))
+        return moov_blob[current.start:current.end]
+
+    return rebuild(moov_box)
+
+
+def fp_copy_fileobj_range(in_file, out_file, size: int, chunk_size: int = FP_V4_COPY_CHUNK):
+    remaining = size
+    while remaining > 0:
+        chunk = in_file.read(min(chunk_size, remaining))
+        if not chunk:
+            raise IOError("Unexpected EOF while copying temporary media payload")
+        out_file.write(chunk)
+        remaining -= len(chunk)
+
+
+def fp_decrypt_mp4_large_streaming_flatten(input_path: str, output_path: str, data, file_handle, tracks, fast_keys, drop_text: bool, fix_sei: bool, reason: str):
+    file_size = len(data)
+    primary_track_id = fp_choose_v4_primary_track(tracks)
+    if primary_track_id is None:
+        with open(output_path, "wb") as out_file:
+            fp_stream_copy_file_range(file_handle, out_file, 0, file_size)
+        print("No encrypted fragmented samples found")
+        return
+    primary_track = tracks[primary_track_id]
+    primary_key = fp_resolve_v4_fast_key(primary_track_id, primary_track, fast_keys)
+
+    ftyp_start = ftyp_end = moov_start = moov_end = None
+    for box_start, box_end, box_header, box_type in fp_children(data, 0, file_size):
+        if box_type == "ftyp" and ftyp_start is None:
+            ftyp_start, ftyp_end = box_start, box_end
+        elif box_type == "moov" and moov_start is None:
+            moov_start, moov_end = box_start, box_end
+    if ftyp_start is None or moov_start is None:
+        fail("Missing ftyp/moov boxes in v4 streaming flatten path")
+
+    print(f"Detected large/long fragmented MP4 ({reason}); using v4 streaming decrypt + flat rewrite.")
+    temp_paths: List[str] = []
+    output_temp_path = output_path + ".stream.tmp"
+    output_dir = os.path.dirname(os.path.abspath(output_path)) or "."
+    table_handles = {}
+    table_paths = {}
+    media_temp = None
+    media_temp_path = None
+    try:
+        for name in ("durations", "ctos", "sizes", "flags"):
+            handle = tempfile.NamedTemporaryFile(prefix=f"pydecrypt_v4_{name}_", suffix=".bin", dir=output_dir, delete=False)
+            table_handles[name] = handle
+            table_paths[name] = handle.name
+            temp_paths.append(handle.name)
+        media_temp = tempfile.NamedTemporaryFile(prefix="pydecrypt_v4_mdat_", suffix=".bin", dir=output_dir, delete=False)
+        media_temp_path = media_temp.name
+        temp_paths.append(media_temp_path)
+
+        sample_count = 0
+        total_duration = 0
+        media_payload_size = 0
+        chunk_sample_counts: List[int] = []
+        chunk_payload_sizes: List[int] = []
+        progress = ProgressPrinter(file_size)
+
+        offset = 0
+        while offset + 8 <= file_size:
+            header = fp_read_box_header(data, offset, file_size)
+            if header is None:
+                break
+            box_start, box_end, box_header, box_type = header
+            if box_type != "moof":
+                progress.update(box_end)
+                fp_madvise_dontneed(data, box_start, box_end)
+                offset = box_end
+                continue
+            next_header = fp_read_box_header(data, box_end, file_size)
+            grouped_records = fp_collect_sample_records_for_single_moof(data, tracks, primary_track_id, box_start, box_end, box_header, next_header)
+            for chunk_records in grouped_records:
+                chunk_count = 0
+                chunk_payload_size = 0
+                for sample_offset, sample_size, sample_aux, track_id, sample_duration, sample_cto, sample_flags in chunk_records:
+                    decrypted = fp_decrypt_sample_to_bytes_from_file(file_handle, sample_offset, sample_size, sample_aux, primary_track, primary_key, fix_sei=fix_sei)
+                    media_temp.write(decrypted)
+                    fp_write_u32(table_handles["durations"], int(sample_duration or 0))
+                    fp_write_u32(table_handles["ctos"], int(sample_cto or 0))
+                    fp_write_u32(table_handles["sizes"], len(decrypted))
+                    fp_write_u32(table_handles["flags"], int(sample_flags or 0))
+                    sample_count += 1
+                    total_duration += int(sample_duration or 0)
+                    chunk_count += 1
+                    chunk_payload_size += len(decrypted)
+                if chunk_count > 0:
+                    chunk_sample_counts.append(chunk_count)
+                    chunk_payload_sizes.append(chunk_payload_size)
+                    media_payload_size += chunk_payload_size
+            progress.update(box_end)
+            fp_madvise_dontneed(data, box_start, box_end)
+            if next_header is not None and next_header[3] == "mdat":
+                fp_madvise_dontneed(data, next_header[0], next_header[1])
+                offset = next_header[1]
+                progress.update(offset)
+            else:
+                offset = box_end
+        progress.finish()
+
+        for handle in table_handles.values():
+            handle.close()
+        media_temp.flush()
+        media_temp.close()
+        media_temp = None
+
+        if sample_count <= 0:
+            with open(output_path, "wb") as out_file:
+                fp_stream_copy_file_range(file_handle, out_file, 0, file_size)
+            print("No encrypted fragmented samples found")
+            return
+
+        moov_blob = bytearray(data[moov_start:moov_end])
+        moov_patches: List[Tuple[int, bytes]] = []
+        if drop_text:
+            moov_patches.extend((pos, payload) for pos, payload in fp_collect_text_track_patches(data) if moov_start <= pos < moov_end)
+        moov_patches.extend(fp_collect_decrypted_mp4_metadata_patches_for_moov(data, tracks, moov_start, moov_end))
+        fp_apply_absolute_patches_to_blob(moov_blob, moov_start, fp_prepare_patch_events(moov_patches))
+        ftyp_bytes = bytes(data[ftyp_start:ftyp_end])
+        target_duration = fp_get_track_duration_from_moov(bytes(moov_blob), Mp4Parser(bytes(moov_blob)).root[0])
+        if target_duration <= 0:
+            target_duration = None
+
+        mdat_header_size = 16 if media_payload_size + 8 > 0xFFFFFFFF else 8
+        new_moov = b""
+        chunk_offsets: List[int] = []
+        for _ in range(8):
+            mdat_data_start = len(ftyp_bytes) + len(new_moov) + mdat_header_size
+            chunk_offsets = []
+            cursor = mdat_data_start
+            for chunk_payload_size in chunk_payload_sizes:
+                chunk_offsets.append(cursor)
+                cursor += chunk_payload_size
+            rebuilt = fp_rebuild_moov_for_v4_stream_flatten(bytes(moov_blob), table_paths, sample_count, chunk_sample_counts, chunk_offsets, target_duration, total_duration)
+            if rebuilt == new_moov:
+                new_moov = rebuilt
+                break
+            new_moov = rebuilt
+
+        with open(output_temp_path, "wb") as out_file:
+            out_file.write(ftyp_bytes)
+            out_file.write(new_moov)
+            out_file.write(fp_make_box_header(b"mdat", media_payload_size))
+            with open(media_temp_path, "rb") as media_in:
+                fp_copy_fileobj_range(media_in, out_file, media_payload_size)
+        os.replace(output_temp_path, output_path)
+        print(
+            "v4 streaming path decrypted and flattened "
+            f"{sample_count} samples into {len(chunk_sample_counts)} chunks without full-file buffering."
+        )
+    except Exception:
+        try:
+            if os.path.exists(output_temp_path):
+                os.remove(output_temp_path)
+        finally:
+            raise
+    finally:
+        for handle in table_handles.values():
+            try:
+                handle.close()
+            except Exception:
+                pass
+        if media_temp is not None:
+            try:
+                media_temp.close()
+            except Exception:
+                pass
+        for temp_path in temp_paths:
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+
+def fp_decrypt_mp4_large_streaming(input_path: str, output_path: str, data, file_handle, tracks, fast_keys, drop_text: bool, fix_sei: bool, reason: str):
+    file_size = len(data)
+    progress = ProgressPrinter(file_size)
+    processed_samples = 0
+    print(f"Detected large/long fragmented MP4 ({reason}); using v4 bounded-memory streaming path.")
+    temp_path = output_path + ".stream.tmp"
+    try:
+        with open(temp_path, "wb") as out_file:
+            offset = 0
+            while offset + 8 <= file_size:
+                header = fp_read_box_header(data, offset, file_size)
+                if header is None:
+                    break
+                box_start, box_end, box_header, box_type = header
+                if box_type == "moov":
+                    patches: List[Tuple[int, bytes]] = []
+                    if drop_text:
+                        patches.extend((pos, payload) for pos, payload in fp_collect_text_track_patches(data) if box_start <= pos < box_end)
+                    patches.extend(fp_collect_decrypted_mp4_metadata_patches_for_moov(data, tracks, box_start, box_end))
+                    fp_write_patched_box_range(data, out_file, box_start, box_end, fp_prepare_patch_events(patches), progress)
+                    fp_madvise_dontneed(data, box_start, box_end)
+                    offset = box_end
+                    continue
+
+                if box_type == "moof":
+                    next_header = fp_read_box_header(data, box_end, file_size)
+                    fragments = fp_collect_fragments_for_single_moof(data, tracks, box_start, box_end, box_header, next_header)
+                    decrypt_events = fp_prepare_decrypt_events(fragments, tracks, fast_keys) if fragments else []
+                    growth_patches, repaired_sei_count = fp_collect_growth_patches(data, decrypt_events, fix_sei=fix_sei) if decrypt_events else ([], 0)
+                    moof_patches = fp_collect_fragment_metadata_patches_for_range(data, box_start, box_end)
+                    moof_patches.extend((pos, payload) for pos, payload in growth_patches if box_start <= pos < box_end)
+                    fp_write_patched_box_range(data, out_file, box_start, box_end, fp_prepare_patch_events(moof_patches), progress)
+                    fp_madvise_dontneed(data, box_start, box_end)
+
+                    if next_header is not None and next_header[3] == "mdat":
+                        mdat_start, mdat_end, mdat_header, mdat_type = next_header
+                        mdat_patch_events = [
+                            (pos, pos + len(payload), "patch", payload)
+                            for pos, payload in growth_patches
+                            if mdat_start <= pos < mdat_end and payload
+                        ]
+                        processed_samples += fp_stream_write_range_with_events(
+                            file_handle,
+                            data,
+                            out_file,
+                            mdat_start,
+                            mdat_end,
+                            mdat_patch_events + decrypt_events,
+                            progress,
+                            fix_sei=fix_sei,
+                        )
+                        fp_madvise_dontneed(data, mdat_start, mdat_end)
+                        offset = mdat_end
+                    else:
+                        processed_samples += len(decrypt_events)
+                        offset = box_end
+                    continue
+
+                local_patches = fp_collect_top_level_box_metadata_patches(data, box_start, box_end, box_type)
+                if local_patches:
+                    fp_write_patched_box_range(data, out_file, box_start, box_end, fp_prepare_patch_events(local_patches), progress)
+                else:
+                    fp_stream_copy_file_range(file_handle, out_file, box_start, box_end, progress)
+                fp_madvise_dontneed(data, box_start, box_end)
+                offset = box_end
+
+            if offset < file_size:
+                fp_stream_copy_file_range(file_handle, out_file, offset, file_size, progress)
+        progress.finish()
+        os.replace(temp_path, output_path)
+        if processed_samples <= 0:
+            print("No encrypted fragmented samples found")
+        else:
+            print(f"v4 streaming path decrypted {processed_samples} samples without flattening or full-file buffering.")
+    except Exception:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        finally:
+            raise
+
 def decrypt_mp4_file(input_path: str, output_path: str, keys_by_track: Dict[int, bytes], keys_by_kid: Dict[bytes, bytes], show_tracks: bool = False, drop_text: bool = True, fix_sei: bool = False):
     if not os.path.isfile(input_path):
         fail("Input file does not exist")
@@ -3786,10 +4593,16 @@ def decrypt_mp4_file(input_path: str, output_path: str, keys_by_track: Dict[int,
                     encrypted = "yes" if track["encrypted"] else "no"
                     print(f"  track={track_id} handler={track['handler']} entry={track['entry_type']} encrypted={encrypted} scheme={track['scheme']}")
 
+            use_streaming, streaming_reason = fp_should_use_v4_large_streaming(data, moov_start, moov_end)
+            if use_streaming:
+                fp_decrypt_mp4_large_streaming_flatten(input_path, output_path, data, file_handle, tracks, fast_keys, drop_text=drop_text, fix_sei=fix_sei, reason=streaming_reason)
+                print("Decrypted successfully")
+                return
+
             fragments, total_samples = fp_collect_fragments_with_fallback(data, tracks)
             if total_samples <= 0:
                 with open(output_path, "wb") as out_file:
-                    out_file.write(data[:])
+                    fp_stream_copy_file_range(file_handle, out_file, 0, len(data))
                 print("No encrypted fragmented samples found")
                 return
 

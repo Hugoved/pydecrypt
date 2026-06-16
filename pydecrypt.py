@@ -2417,6 +2417,240 @@ def fp_parse_senc(data, box_start, box_end, box_header, iv_size, constant_iv):
         entries.append((iv, subsamples))
     return entries
 
+def fp_parse_saiz_fast(data, box_start, box_end, box_header):
+    if box_start + box_header + 9 > box_end:
+        return []
+    version, flags = fp_parse_fullbox(data, box_start, box_header)
+    offset = box_start + box_header + 4
+    if flags & 0x000001:
+        if offset + 8 > box_end:
+            return []
+        offset += 8
+    if offset + 5 > box_end:
+        return []
+    default_info_size = data[offset]
+    sample_count = fp_be32(data, offset + 1)
+    offset += 5
+    if default_info_size:
+        return [default_info_size] * sample_count
+    if offset + sample_count > box_end:
+        sample_count = max(0, box_end - offset)
+    return [data[offset + index] for index in range(sample_count)]
+
+
+def fp_parse_saio_fast(data, box_start, box_end, box_header):
+    if box_start + box_header + 8 > box_end:
+        return []
+    version, flags = fp_parse_fullbox(data, box_start, box_header)
+    offset = box_start + box_header + 4
+    if flags & 0x000001:
+        if offset + 8 > box_end:
+            return []
+        offset += 8
+    if offset + 4 > box_end:
+        return []
+    entry_count = fp_be32(data, offset)
+    offset += 4
+    offsets = []
+    for _ in range(entry_count):
+        item_size = 8 if version == 1 else 4
+        if offset + item_size > box_end:
+            break
+        offsets.append(fp_be64(data, offset) if version == 1 else fp_be32(data, offset))
+        offset += item_size
+    return offsets
+
+
+def fp_expand_cenc_iv(iv):
+    if len(iv) == 8:
+        return iv + b"\x00" * 8
+    return iv
+
+
+def fp_parse_aux_info_from_saiz_saio_fast(data, sample_info_sizes, offsets, iv_size, constant_iv, offset_base=0):
+    if not sample_info_sizes or not offsets:
+        return []
+    base = offset_base + offsets[0]
+    if base < 0 or base >= len(data):
+        return []
+    total = sum(sample_info_sizes)
+    if base + total > len(data):
+        total = max(0, len(data) - base)
+    blob = data[base:base + total]
+    entries = []
+    cursor = 0
+    for info_size in sample_info_sizes:
+        if info_size < 0 or cursor + info_size > len(blob):
+            break
+        sample_blob = blob[cursor:cursor + info_size]
+        if iv_size == 0:
+            iv = constant_iv
+            sub_offset = 0
+        else:
+            if len(sample_blob) < iv_size:
+                break
+            iv = bytes(sample_blob[:iv_size])
+            sub_offset = iv_size
+        iv = fp_expand_cenc_iv(iv)
+        subsamples = []
+        if sub_offset + 2 <= len(sample_blob):
+            subsample_count = fp_be16(sample_blob, sub_offset)
+            sub_offset += 2
+            for _ in range(subsample_count):
+                if sub_offset + 6 > len(sample_blob):
+                    break
+                clear_size = fp_be16(sample_blob, sub_offset)
+                encrypted_size = fp_be32(sample_blob, sub_offset + 2)
+                subsamples.append((clear_size, encrypted_size))
+                sub_offset += 6
+        entries.append((iv, subsamples))
+        cursor += info_size
+    return entries
+
+
+def fp_count_top_level_boxes(data, wanted_type):
+    count = 0
+    for _, _, _, box_type in fp_children(data, 0, len(data)):
+        if box_type == wanted_type:
+            count += 1
+    return count
+
+
+def fp_expected_encrypted_fragment_samples(data, tracks):
+    samples_by_track = fp_collect_all_fragment_samples(data)
+    expected = 0
+    for track_id, samples in samples_by_track.items():
+        track = tracks.get(track_id)
+        if track and track.get("encrypted"):
+            expected += len(samples)
+    return expected
+
+
+def fp_fragment_collection_is_suspicious(data, tracks, collected_count):
+    expected = fp_expected_encrypted_fragment_samples(data, tracks)
+    moof_count = fp_count_top_level_boxes(data, "moof")
+    if moof_count <= 1 or expected <= 0:
+        return False, expected, moof_count
+    missing = expected - collected_count
+    if missing <= 0:
+        return False, expected, moof_count
+    suspicious = collected_count <= max(25, int(expected * 0.75)) and missing >= 25
+    return suspicious, expected, moof_count
+
+
+def fp_collect_fragments_aux_fallback(data, tracks):
+    fragments = []
+    total_samples = 0
+    file_size = len(data)
+    offset = 0
+    while offset + 8 <= file_size:
+        header = fp_read_box_header(data, offset, file_size)
+        if header is None:
+            break
+        box_start, box_end, box_header, box_type = header
+        if box_type == "moof":
+            next_header = fp_read_box_header(data, box_end, file_size)
+            mdat_size_offset = None
+            mdat_data_start = None
+            if next_header is not None and next_header[3] == "mdat":
+                mdat_size_offset = next_header[0]
+                mdat_data_start = next_header[0] + next_header[2]
+
+            for traf_start, traf_end, traf_header, traf_type in fp_children(data, box_start + box_header, box_end):
+                if traf_type != "traf":
+                    continue
+                tfhd = None
+                trun_boxes = []
+                senc_box = None
+                saiz_box = None
+                saio_box = None
+                for child_start, child_end, child_header, child_type in fp_children(data, traf_start + traf_header, traf_end):
+                    child_uuid = fp_box_uuid(data, child_start, child_header, child_type)
+                    if child_type == "tfhd":
+                        tfhd = fp_parse_tfhd(data, child_start, child_end, child_header)
+                    elif child_type == "trun":
+                        trun_boxes.append((child_start, child_end, child_header))
+                    elif child_type == "senc" or (child_type == "uuid" and child_uuid == FP_PIFF_SAMPLE_ENCRYPTION_UUID):
+                        senc_box = (child_start, child_end, child_header)
+                    elif child_type == "saiz":
+                        saiz_box = (child_start, child_end, child_header)
+                    elif child_type == "saio":
+                        saio_box = (child_start, child_end, child_header)
+
+                if not tfhd or not trun_boxes:
+                    continue
+                track_id = tfhd["track_id"]
+                track = tracks.get(track_id)
+                if not track or not track.get("encrypted"):
+                    continue
+
+                senc_entries = None
+                if senc_box is not None:
+                    senc_entries = fp_parse_senc(data, senc_box[0], senc_box[1], senc_box[2], track["iv_size"], track["constant_iv"])
+                elif saiz_box is not None and saio_box is not None:
+                    sample_info_sizes = fp_parse_saiz_fast(data, saiz_box[0], saiz_box[1], saiz_box[2])
+                    aux_offsets = fp_parse_saio_fast(data, saio_box[0], saio_box[1], saio_box[2])
+                    senc_entries = fp_parse_aux_info_from_saiz_saio_fast(
+                        data,
+                        sample_info_sizes,
+                        aux_offsets,
+                        track["iv_size"],
+                        track["constant_iv"],
+                        offset_base=box_start,
+                    )
+                if not senc_entries:
+                    continue
+
+                trex = track.get("trex", {})
+                default_sample_size = tfhd.get("default_sample_size", trex.get("default_sample_size", 0))
+                base = tfhd.get("base_data_offset", box_start)
+                aux_index = 0
+                previous_sample_end = None
+                for trun_start, trun_end, trun_header in trun_boxes:
+                    sample_count, data_offset, samples = fp_parse_trun(data, trun_start, trun_end, trun_header)
+                    if data_offset is not None:
+                        sample_offset = base + data_offset
+                    elif previous_sample_end is not None:
+                        sample_offset = previous_sample_end
+                    elif mdat_data_start is not None:
+                        sample_offset = mdat_data_start
+                    else:
+                        sample_offset = base
+                    for sample in samples:
+                        sample_size = sample.get("size", default_sample_size)
+                        if sample_size <= 0:
+                            aux_index += 1
+                            continue
+                        if aux_index >= len(senc_entries):
+                            sample_offset += sample_size
+                            aux_index += 1
+                            continue
+                        sample_aux = senc_entries[aux_index]
+                        sample_size_offset = sample.get("size_offset")
+                        if 0 <= sample_offset and sample_offset + sample_size <= file_size:
+                            fragments.append((sample_offset, sample_size, sample_aux, track_id, sample_size_offset, mdat_size_offset))
+                        sample_offset += sample_size
+                        previous_sample_end = sample_offset
+                        aux_index += 1
+                total_samples += sum(1 for item in fragments if item[3] == track_id)
+        offset = box_end
+    return fragments, len(fragments)
+
+
+def fp_collect_fragments_with_fallback(data, tracks):
+    fragments, total_samples = fp_collect_fragments(data, tracks)
+    suspicious, expected, moof_count = fp_fragment_collection_is_suspicious(data, tracks, total_samples)
+    if not suspicious:
+        return fragments, total_samples
+    fallback_fragments, fallback_total = fp_collect_fragments_aux_fallback(data, tracks)
+    if fallback_total > total_samples:
+        print(
+            "Detected fragmented MP4 aux-info layout that the primary parser only partially collected; "
+            f"using compatibility fallback ({fallback_total}/{expected} encrypted samples across {moof_count} moof boxes)."
+        )
+        return fallback_fragments, fallback_total
+    return fragments, total_samples
+
 
 def fp_print_progress(index, total, start_time):
     if total <= 0:
@@ -3179,6 +3413,16 @@ def fp_flatten_fragmented_mp4_in_place(file_path: str):
     if not primary_samples:
         return
 
+    moof_count = sum(1 for _, _, _, box_type in fp_children(source, 0, len(source)) if box_type == "moof")
+    last_sample_end = max(sample_offset + sample_size for sample_offset, sample_size, _, _, _ in primary_samples)
+    if moof_count > 1 and last_sample_end < int(len(source) * 0.75):
+        print(
+            "Skipping fragmented-to-flat rewrite because only an early prefix of media samples "
+            f"was visible to the flattening pass ({len(primary_samples)} samples, last sample ends at "
+            f"{last_sample_end}/{len(source)} bytes across {moof_count} moof boxes)."
+        )
+        return
+
     total_duration = sum(sample[2] for sample in primary_samples)
 
     def rebuild(current: Box, stco_offset: int) -> bytes:
@@ -3263,7 +3507,7 @@ def decrypt_mp4_file(input_path: str, output_path: str, keys_by_track: Dict[int,
                     encrypted = "yes" if track["encrypted"] else "no"
                     print(f"  track={track_id} handler={track['handler']} entry={track['entry_type']} encrypted={encrypted} scheme={track['scheme']}")
 
-            fragments, total_samples = fp_collect_fragments(data, tracks)
+            fragments, total_samples = fp_collect_fragments_with_fallback(data, tracks)
             if total_samples <= 0:
                 with open(output_path, "wb") as out_file:
                     out_file.write(data[:])

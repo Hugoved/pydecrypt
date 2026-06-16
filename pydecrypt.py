@@ -3389,6 +3389,279 @@ def fp_build_flat_sample_table(original_stsd: bytes, samples: List[Tuple[int, in
     return fp_make_box(b"stbl", original_stsd + stts + ctts + stsc + stsz + stco + stss)
 
 
+def fp_collect_all_fragment_sample_chunks(data) -> Dict[int, List[List[Tuple[int, int, int, int, int]]]]:
+    moov_start = None
+    moov_end = None
+    for box_start, box_end, box_header, box_type in fp_children(data, 0, len(data)):
+        if box_type == "moov":
+            moov_start = box_start
+            moov_end = box_end
+            break
+    if moov_start is None:
+        return {}
+
+    tracks = fp_parse_moov(data, moov_start, moov_end)
+    chunks_by_track: Dict[int, List[List[Tuple[int, int, int, int, int]]]] = {}
+
+    offset = 0
+    file_size = len(data)
+    while offset < file_size:
+        header = fp_read_box_header(data, offset, file_size)
+        if header is None:
+            break
+        box_start, box_end, box_header, box_type = header
+        if box_type != "moof":
+            offset = box_end
+            continue
+
+        next_header = fp_read_box_header(data, box_end, file_size)
+        mdat_data_start = None
+        if next_header is not None and next_header[3] == "mdat":
+            mdat_data_start = next_header[0] + next_header[2]
+
+        for traf_start, traf_end, traf_header, traf_type in fp_children(data, box_start + box_header, box_end):
+            if traf_type != "traf":
+                continue
+            tfhd = None
+            truns = []
+            for child_start, child_end, child_header, child_type in fp_children(data, traf_start + traf_header, traf_end):
+                if child_type == "tfhd":
+                    tfhd = fp_parse_tfhd(data, child_start, child_end, child_header)
+                elif child_type == "trun":
+                    truns.append(fp_parse_trun(data, child_start, child_end, child_header))
+            if not tfhd or not truns:
+                continue
+            track_id = tfhd["track_id"]
+            track = tracks.get(track_id, {})
+            trex = track.get("trex", {})
+            default_duration = tfhd.get("default_sample_duration", trex.get("default_sample_duration", 0))
+            default_size = tfhd.get("default_sample_size", trex.get("default_sample_size", 0))
+            default_flags = tfhd.get("default_sample_flags", trex.get("default_sample_flags", 0))
+            base = tfhd.get("base_data_offset", box_start)
+            previous_sample_end = None
+            chunks_by_track.setdefault(track_id, [])
+            for sample_count, data_offset, samples in truns:
+                if data_offset is not None:
+                    sample_offset = base + data_offset
+                elif previous_sample_end is not None:
+                    sample_offset = previous_sample_end
+                elif mdat_data_start is not None:
+                    sample_offset = mdat_data_start
+                else:
+                    continue
+                chunk = []
+                first_flags = None
+                for index, sample in enumerate(samples):
+                    sample_size = sample.get("size", default_size)
+                    sample_duration = sample.get("duration", default_duration)
+                    sample_flags = sample.get("flags", first_flags if index == 0 and first_flags is not None else default_flags)
+                    sample_cto = sample.get("composition_time_offset", 0)
+                    if sample_size > 0:
+                        if 0 <= sample_offset and sample_offset + sample_size <= file_size:
+                            chunk.append((sample_offset, sample_size, sample_duration, sample_cto, sample_flags))
+                    sample_offset += sample_size
+                previous_sample_end = sample_offset
+                if chunk:
+                    chunks_by_track[track_id].append(chunk)
+        offset = box_end
+
+    return chunks_by_track
+
+
+def fp_flatten_chunks_to_samples(chunks: List[List[Tuple[int, int, int, int, int]]]) -> List[Tuple[int, int, int, int, int]]:
+    samples: List[Tuple[int, int, int, int, int]] = []
+    for chunk in chunks:
+        samples.extend(chunk)
+    return samples
+
+
+def fp_build_chunked_sample_table(original_stsd: bytes, chunks: List[List[Tuple[int, int, int, int, int]]], chunk_offsets: List[int], target_duration: Optional[int] = None) -> bytes:
+    samples = fp_flatten_chunks_to_samples(chunks)
+    durations = [sample[2] for sample in samples]
+    if target_duration is not None and durations:
+        duration_delta = target_duration - sum(durations)
+        if 0 < duration_delta <= max(durations) * 4:
+            durations[-1] += duration_delta
+    composition_offsets = [sample[3] for sample in samples]
+    sizes = [sample[1] for sample in samples]
+    flags = [sample[4] for sample in samples]
+
+    stts_entries = fp_compress_table_values(durations)
+    stts_payload = struct.pack(">I", len(stts_entries)) + b"".join(struct.pack(">II", count, value) for count, value in stts_entries)
+    stts = fp_make_full_box(b"stts", 0, 0, stts_payload)
+
+    ctts_entries = fp_compress_table_values(composition_offsets)
+    ctts_payload = struct.pack(">I", len(ctts_entries)) + b"".join(struct.pack(">II", count, value) for count, value in ctts_entries)
+    ctts = fp_make_full_box(b"ctts", 0, 0, ctts_payload)
+
+    stsc_entries: List[Tuple[int, int, int]] = []
+    previous_samples_per_chunk = None
+    for chunk_index, chunk in enumerate(chunks, 1):
+        samples_per_chunk = len(chunk)
+        if samples_per_chunk <= 0:
+            continue
+        if samples_per_chunk != previous_samples_per_chunk:
+            stsc_entries.append((chunk_index, samples_per_chunk, 1))
+            previous_samples_per_chunk = samples_per_chunk
+    stsc_payload = struct.pack(">I", len(stsc_entries)) + b"".join(struct.pack(">III", *entry) for entry in stsc_entries)
+    stsc = fp_make_full_box(b"stsc", 0, 0, stsc_payload)
+
+    stsz = fp_make_full_box(b"stsz", 0, 0, struct.pack(">II", 0, len(samples)) + b"".join(struct.pack(">I", size) for size in sizes))
+
+    if chunk_offsets and max(chunk_offsets) > 0xFFFFFFFF:
+        chunk_table = fp_make_full_box(b"co64", 0, 0, struct.pack(">I", len(chunk_offsets)) + b"".join(struct.pack(">Q", offset) for offset in chunk_offsets))
+    else:
+        chunk_table = fp_make_full_box(b"stco", 0, 0, struct.pack(">I", len(chunk_offsets)) + b"".join(struct.pack(">I", offset & 0xFFFFFFFF) for offset in chunk_offsets))
+
+    sync_samples = [index + 1 for index, sample_flags in enumerate(flags) if not (sample_flags & 0x00010000)]
+    stss = fp_make_full_box(b"stss", 0, 0, struct.pack(">I", len(sync_samples)) + b"".join(struct.pack(">I", index) for index in sync_samples))
+
+    sdtp_payload = bytearray()
+    for sample_flags in flags:
+        sample_depends_on = (sample_flags >> 24) & 0x03
+        sample_is_depended_on = (sample_flags >> 22) & 0x03
+        sample_has_redundancy = (sample_flags >> 20) & 0x03
+        sdtp_payload.append((sample_depends_on << 4) | (sample_is_depended_on << 2) | sample_has_redundancy)
+    sdtp = fp_make_full_box(b"sdtp", 0, 0, bytes(sdtp_payload))
+
+    return fp_make_box(b"stbl", original_stsd + stts + ctts + stsc + stsz + chunk_table + stss + sdtp)
+
+
+def fp_detect_hevc_parameter_sets_in_sync_samples(source: bytes, samples: List[Tuple[int, int, int, int, int]], limit: int = 12) -> bool:
+    checked = 0
+    for sample_offset, sample_size, sample_duration, sample_cto, sample_flags in samples:
+        if sample_flags & 0x00010000:
+            continue
+        sample = source[sample_offset:sample_offset + sample_size]
+        cursor = 0
+        has_parameter_set = False
+        has_idr = False
+        while cursor + 4 <= len(sample):
+            nal_size = int.from_bytes(sample[cursor:cursor + 4], "big")
+            cursor += 4
+            if nal_size <= 0 or cursor + nal_size > len(sample):
+                break
+            if nal_size >= 2:
+                nal_type = (sample[cursor] >> 1) & 0x3F
+                if nal_type in {32, 33, 34}:
+                    has_parameter_set = True
+                if nal_type in {19, 20}:
+                    has_idr = True
+            cursor += nal_size
+        checked += 1
+        if not (has_parameter_set and has_idr):
+            return False
+        if checked >= limit:
+            return True
+    return checked > 0
+
+
+def fp_get_track_duration_from_moov(data: bytes, moov: Box) -> int:
+    for trak in moov.children:
+        if trak.type != b"trak":
+            continue
+        mdia = None
+        for child in trak.children:
+            if child.type == b"mdia":
+                mdia = child
+                break
+        if not mdia:
+            continue
+        for child in mdia.children:
+            if child.type != b"mdhd":
+                continue
+            raw = data[child.start:child.end]
+            if len(raw) < 16:
+                continue
+            version = raw[8]
+            if version == 1 and len(raw) >= 40:
+                return struct.unpack_from(">Q", raw, 32)[0]
+            if version == 0 and len(raw) >= 32:
+                return struct.unpack_from(">I", raw, 24)[0]
+    return 0
+
+
+def fp_should_use_v3_chunked_flatten(source: bytes, parser: Mp4Parser, moov: Box, primary_track_id: int, primary_samples: List[Tuple[int, int, int, int, int]], primary_chunks: List[List[Tuple[int, int, int, int, int]]]) -> bool:
+    moof_count = sum(1 for _, _, _, box_type in fp_children(source, 0, len(source)) if box_type == "moof")
+    if moof_count <= 1 or len(primary_chunks) <= 1 or not primary_samples:
+        return False
+    tracks = fp_parse_moov(source, moov.start, moov.end)
+    track = tracks.get(primary_track_id)
+    if not track or not fp_track_uses_hevc_bitstream(track):
+        return False
+    if len(primary_chunks) < max(8, moof_count // 2):
+        return False
+    if not fp_detect_hevc_parameter_sets_in_sync_samples(source, primary_samples):
+        return False
+    return True
+
+
+def fp_flatten_fragmented_mp4_chunked_compat(file_path: str, source: bytes, parser: Mp4Parser, ftyp: Box, moov: Box, primary_track_id: int, primary_chunks: List[List[Tuple[int, int, int, int, int]]]) -> bool:
+    primary_samples = fp_flatten_chunks_to_samples(primary_chunks)
+    if not primary_samples:
+        return False
+
+    def rebuild(current: Box, chunk_offsets: List[int]) -> bytes:
+        if current.type == b"mvex":
+            return b""
+        if current.type == b"stbl":
+            stsd = None
+            for child in current.children:
+                if child.type == b"stsd":
+                    stsd = child
+                    break
+            if stsd is None:
+                return source[current.start:current.end]
+            target_duration = fp_get_track_duration_from_moov(source, moov)
+            if target_duration <= 0:
+                target_duration = None
+            return fp_build_chunked_sample_table(source[stsd.start:stsd.end], primary_chunks, chunk_offsets, target_duration=target_duration)
+        if current.children:
+            payload_start = current.start + current.header_size
+            payload = bytearray()
+            position = payload_start
+            for child in current.children:
+                if position < child.start:
+                    payload.extend(source[position:child.start])
+                payload.extend(rebuild(child, chunk_offsets))
+                position = child.end
+            if position < current.end:
+                payload.extend(source[position:current.end])
+            return fp_make_box(current.type, bytes(payload))
+        return source[current.start:current.end]
+
+    new_moov = b""
+    chunk_offsets: List[int] = []
+    for _ in range(6):
+        mdat_data_start = (ftyp.end - ftyp.start) + len(new_moov) + 8
+        chunk_offsets = []
+        cursor = mdat_data_start
+        for chunk in primary_chunks:
+            chunk_offsets.append(cursor)
+            cursor += sum(sample_size for _, sample_size, _, _, _ in chunk)
+        rebuilt = rebuild(moov, chunk_offsets)
+        if rebuilt == new_moov:
+            new_moov = rebuilt
+            break
+        new_moov = rebuilt
+
+    mdat_payload = bytearray()
+    for chunk in primary_chunks:
+        for sample_offset, sample_size, _, _, _ in chunk:
+            mdat_payload.extend(source[sample_offset:sample_offset + sample_size])
+
+    expected_sample_count = len(primary_samples)
+    actual_sample_count = sum(len(chunk) for chunk in primary_chunks)
+    if expected_sample_count != actual_sample_count:
+        fail("Chunked compatibility flatten generated an inconsistent sample count")
+
+    flattened = source[ftyp.start:ftyp.end] + new_moov + fp_make_box(b"mdat", bytes(mdat_payload))
+    temp_path = file_path + ".flat.tmp"
+    with open(temp_path, "wb") as file_handle:
+        file_handle.write(flattened)
+    os.replace(temp_path, file_path) 
+    return True
+
 def fp_flatten_fragmented_mp4_in_place(file_path: str):
     with open(file_path, "rb") as file_handle:
         source = file_handle.read()
@@ -3412,6 +3685,12 @@ def fp_flatten_fragmented_mp4_in_place(file_path: str):
     primary_samples = samples_by_track[primary_track_id]
     if not primary_samples:
         return
+
+    chunk_map = fp_collect_all_fragment_sample_chunks(source)
+    primary_chunks = chunk_map.get(primary_track_id, [])
+    if fp_should_use_v3_chunked_flatten(source, parser, moov, primary_track_id, primary_samples, primary_chunks):
+        if fp_flatten_fragmented_mp4_chunked_compat(file_path, source, parser, ftyp, moov, primary_track_id, primary_chunks):
+            return
 
     moof_count = sum(1 for _, _, _, box_type in fp_children(source, 0, len(source)) if box_type == "moof")
     last_sample_end = max(sample_offset + sample_size for sample_offset, sample_size, _, _, _ in primary_samples)

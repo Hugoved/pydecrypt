@@ -4,7 +4,6 @@ import os
 import struct
 import sys
 import time
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -3389,6 +3388,7 @@ def fp_build_flat_sample_table(original_stsd: bytes, samples: List[Tuple[int, in
 
     return fp_make_box(b"stbl", original_stsd + stts + ctts + stsc + stsz + stco + stss)
 
+
 def fp_collect_all_fragment_sample_chunks(data) -> Dict[int, List[List[Tuple[int, int, int, int, int]]]]:
     moov_start = None
     moov_end = None
@@ -3581,7 +3581,7 @@ def fp_get_track_duration_from_moov(data: bytes, moov: Box) -> int:
     return 0
 
 
-def fp_should_use_v3_chunked_flatten(source: bytes, parser: Mp4Parser, moov: Box, primary_track_id: int, primary_samples: List[Tuple[int, int, int, int, int]], primary_chunks: List[List[Tuple[int, int, int, int, int]]]) -> bool:
+def fp_should_use_chunked_compatibility_flatten(source: bytes, parser: Mp4Parser, moov: Box, primary_track_id: int, primary_samples: List[Tuple[int, int, int, int, int]], primary_chunks: List[List[Tuple[int, int, int, int, int]]]) -> bool:
     moof_count = sum(1 for _, _, _, box_type in fp_children(source, 0, len(source)) if box_type == "moof")
     if moof_count <= 1 or len(primary_chunks) <= 1 or not primary_samples:
         return False
@@ -3656,13 +3656,11 @@ def fp_flatten_fragmented_mp4_chunked_compat(file_path: str, source: bytes, pars
         fail("Chunked compatibility flatten generated an inconsistent sample count")
 
     flattened = source[ftyp.start:ftyp.end] + new_moov + fp_make_box(b"mdat", bytes(mdat_payload))
-    temp_path = file_path + ".flat.tmp"
-    with open(temp_path, "wb") as file_handle:
+    with open(file_path, "wb") as file_handle:
         file_handle.write(flattened)
-    os.replace(temp_path, file_path)
     print(
         "Detected fragmented HEVC layout with dense moof/mdat boundaries; "
-        f"using v3 chunked compatibility flatten ({len(primary_chunks)} chunks, {expected_sample_count} samples)."
+        f"using chunked compatibility flatten ({len(primary_chunks)} chunks, {expected_sample_count} samples)."
     )
     return True
 
@@ -3692,10 +3690,9 @@ def fp_flatten_fragmented_mp4_in_place(file_path: str):
 
     chunk_map = fp_collect_all_fragment_sample_chunks(source)
     primary_chunks = chunk_map.get(primary_track_id, [])
-    if fp_should_use_v3_chunked_flatten(source, parser, moov, primary_track_id, primary_samples, primary_chunks):
+    if fp_should_use_chunked_compatibility_flatten(source, parser, moov, primary_track_id, primary_samples, primary_chunks):
         if fp_flatten_fragmented_mp4_chunked_compat(file_path, source, parser, ftyp, moov, primary_track_id, primary_chunks):
             return
-        
     moof_count = sum(1 for _, _, _, box_type in fp_children(source, 0, len(source)) if box_type == "moof")
     last_sample_end = max(sample_offset + sample_size for sample_offset, sample_size, _, _, _ in primary_samples)
     if moof_count > 1 and last_sample_end < int(len(source) * 0.75):
@@ -3748,19 +3745,18 @@ def fp_flatten_fragmented_mp4_in_place(file_path: str):
         mdat_payload.extend(source[sample_offset:sample_offset + sample_size])
 
     flattened = source[ftyp.start:ftyp.end] + new_moov + fp_make_box(b"mdat", bytes(mdat_payload))
-    temp_path = file_path + ".flat.tmp"
-    with open(temp_path, "wb") as file_handle:
+    with open(file_path, "wb") as file_handle:
         file_handle.write(flattened)
-    os.replace(temp_path, file_path)
-
-FP_V4_STREAM_FILE_SIZE_THRESHOLD = 1024 * 1024 * 1024
-FP_V4_STREAM_MOOF_THRESHOLD = 4096
-FP_V4_STREAM_DURATION_THRESHOLD_SECONDS = 2 * 60 * 60
-FP_V4_MAX_PATCHED_BOX_BYTES = 128 * 1024 * 1024
-FP_V4_COPY_CHUNK = 4 * 1024 * 1024
 
 
-def fp_stream_copy_file_range(file_handle, out_file, start: int, end: int, progress: Optional[ProgressPrinter] = None, chunk_size: int = FP_V4_COPY_CHUNK):
+FP_STREAM_FILE_SIZE_THRESHOLD = 1024 * 1024 * 1024
+FP_STREAM_MOOF_THRESHOLD = 4096
+FP_STREAM_DURATION_THRESHOLD_SECONDS = 2 * 60 * 60
+FP_STREAM_MAX_PATCHED_BOX_BYTES = 128 * 1024 * 1024
+FP_STREAM_COPY_CHUNK = 4 * 1024 * 1024
+
+
+def fp_stream_copy_file_range(file_handle, out_file, start: int, end: int, progress: Optional[ProgressPrinter] = None, chunk_size: int = FP_STREAM_COPY_CHUNK):
     if end < start:
         raise ValueError("Invalid copy range")
     file_handle.seek(start)
@@ -3785,7 +3781,7 @@ def fp_read_exact_range(file_handle, start: int, size: int) -> bytes:
     chunks = []
     remaining = size
     while remaining > 0:
-        chunk = file_handle.read(min(FP_V4_COPY_CHUNK, remaining))
+        chunk = file_handle.read(min(FP_STREAM_COPY_CHUNK, remaining))
         if not chunk:
             raise IOError("Unexpected EOF while reading encrypted sample")
         chunks.append(chunk)
@@ -3833,8 +3829,8 @@ def fp_write_patched_box_range(data, out_file, start: int, end: int, patches: Li
     if end < start:
         raise ValueError("Invalid patched range")
     size = end - start
-    if size > FP_V4_MAX_PATCHED_BOX_BYTES:
-        fail(f"Refusing to buffer an unexpectedly large metadata box of {size} bytes in v4 streaming path")
+    if size > FP_STREAM_MAX_PATCHED_BOX_BYTES:
+        fail(f"Refusing to buffer an unexpectedly large metadata box of {size} bytes in streaming path")
     blob = bytearray(data[start:end])
     fp_apply_absolute_patches_to_blob(blob, start, patches)
     out_file.write(blob)
@@ -3929,15 +3925,15 @@ def fp_get_mvhd_duration_seconds(data, moov_start: int, moov_end: int) -> float:
     return 0.0
 
 
-def fp_should_use_v4_large_streaming(data, moov_start: int, moov_end: int) -> Tuple[bool, str]:
+def fp_should_use_large_streaming(data, moov_start: int, moov_end: int) -> Tuple[bool, str]:
     file_size = len(data)
-    if file_size >= FP_V4_STREAM_FILE_SIZE_THRESHOLD:
+    if file_size >= FP_STREAM_FILE_SIZE_THRESHOLD:
         return True, f"file size {file_size} bytes"
     moof_count = fp_count_top_level_boxes(data, "moof")
-    if moof_count >= FP_V4_STREAM_MOOF_THRESHOLD:
+    if moof_count >= FP_STREAM_MOOF_THRESHOLD:
         return True, f"{moof_count} moof fragments"
     duration_seconds = fp_get_mvhd_duration_seconds(data, moov_start, moov_end)
-    if duration_seconds >= FP_V4_STREAM_DURATION_THRESHOLD_SECONDS and moof_count > 1:
+    if duration_seconds >= FP_STREAM_DURATION_THRESHOLD_SECONDS and moof_count > 1:
         return True, f"duration {duration_seconds:.3f}s across {moof_count} moof fragments"
     return False, ""
 
@@ -4037,7 +4033,7 @@ def fp_stream_write_range_with_events(file_handle, data, out_file, start: int, e
     previous_end = start
     for event in events:
         if event[0] < previous_end:
-            fail("Overlapping stream events were generated in v4 streaming path")
+            fail("Overlapping stream events were generated in streaming path")
         previous_end = event[1]
 
     cursor = start
@@ -4079,7 +4075,7 @@ def fp_iter_u32_file(path: str, count: int):
         for _ in range(count):
             raw = file_handle.read(4)
             if len(raw) != 4:
-                raise IOError("Unexpected EOF while reading temporary sample table")
+                raise IOError("Unexpected EOF while reading sample table")
             yield struct.unpack(">I", raw)[0]
 
 
@@ -4095,7 +4091,7 @@ def fp_compress_u32_file(path: str, count: int, last_delta: int = 0) -> List[Tup
     return entries
 
 
-def fp_choose_v4_primary_track(tracks) -> Optional[int]:
+def fp_choose_stream_primary_track(tracks) -> Optional[int]:
     for track_id in sorted(tracks):
         track = tracks[track_id]
         if track.get("encrypted") and str(track.get("handler", "")).lower() == "vide" and not fp_is_text_or_caption_track(track):
@@ -4107,7 +4103,7 @@ def fp_choose_v4_primary_track(tracks) -> Optional[int]:
     return None
 
 
-def fp_resolve_v4_fast_key(track_id: int, track, fast_keys):
+def fp_resolve_stream_fast_key(track_id: int, track, fast_keys):
     key = fast_keys.get(str(track_id)) or fast_keys.get(track.get("kid", "")) or fast_keys.get("00000000000000000000000000000000")
     if key is None:
         fail(f"Missing key for KID {track.get('kid', '-')}")
@@ -4205,7 +4201,7 @@ def fp_collect_sample_records_for_single_moof(data, tracks, primary_track_id: in
     return records
 
 
-def fp_build_chunked_sample_table_from_temp(original_stsd: bytes, table_paths: Dict[str, str], sample_count: int, chunk_sample_counts: List[int], chunk_offsets: List[int], target_duration: Optional[int], total_duration: int) -> bytes:
+def fp_build_chunked_sample_table_from_file(original_stsd: bytes, table_paths: Dict[str, str], sample_count: int, chunk_sample_counts: List[int], chunk_offsets: List[int], target_duration: Optional[int], total_duration: int) -> bytes:
     duration_delta = 0
     if target_duration is not None and sample_count > 0:
         candidate_delta = target_duration - total_duration
@@ -4258,7 +4254,7 @@ def fp_build_chunked_sample_table_from_temp(original_stsd: bytes, table_paths: D
     return fp_make_box(b"stbl", original_stsd + stts + ctts + stsc + stsz + chunk_table + stss + sdtp)
 
 
-def fp_rebuild_moov_for_v4_stream_flatten(moov_blob: bytes, table_paths: Dict[str, str], sample_count: int, chunk_sample_counts: List[int], chunk_offsets: List[int], target_duration: Optional[int], total_duration: int) -> bytes:
+def fp_rebuild_moov_for_stream_flatten(moov_blob: bytes, table_paths: Dict[str, str], sample_count: int, chunk_sample_counts: List[int], chunk_offsets: List[int], target_duration: Optional[int], total_duration: int) -> bytes:
     moov_parser = Mp4Parser(moov_blob)
     moov_box = None
     for top in moov_parser.root:
@@ -4266,7 +4262,7 @@ def fp_rebuild_moov_for_v4_stream_flatten(moov_blob: bytes, table_paths: Dict[st
             moov_box = top
             break
     if moov_box is None:
-        fail("No moov box found while rebuilding v4 streaming output")
+        fail("No moov box found while rebuilding streaming output")
 
     def rebuild(current: Box) -> bytes:
         if current.type == b"mvex":
@@ -4279,7 +4275,7 @@ def fp_rebuild_moov_for_v4_stream_flatten(moov_blob: bytes, table_paths: Dict[st
                     break
             if stsd is None:
                 return moov_blob[current.start:current.end]
-            return fp_build_chunked_sample_table_from_temp(
+            return fp_build_chunked_sample_table_from_file(
                 moov_blob[stsd.start:stsd.end],
                 table_paths,
                 sample_count,
@@ -4305,26 +4301,392 @@ def fp_rebuild_moov_for_v4_stream_flatten(moov_blob: bytes, table_paths: Dict[st
     return rebuild(moov_box)
 
 
-def fp_copy_fileobj_range(in_file, out_file, size: int, chunk_size: int = FP_V4_COPY_CHUNK):
+def fp_copy_fileobj_range(in_file, out_file, size: int, chunk_size: int = FP_STREAM_COPY_CHUNK):
     remaining = size
     while remaining > 0:
         chunk = in_file.read(min(chunk_size, remaining))
         if not chunk:
-            raise IOError("Unexpected EOF while copying temporary media payload")
+            raise IOError("Unexpected EOF while copying media payload")
         out_file.write(chunk)
         remaining -= len(chunk)
 
 
+
+def fp_iter_primary_stream_chunks(data, tracks, primary_track_id: int):
+    file_size = len(data)
+    offset = 0
+    while offset + 8 <= file_size:
+        header = fp_read_box_header(data, offset, file_size)
+        if header is None:
+            break
+        box_start, box_end, box_header, box_type = header
+        if box_type != "moof":
+            offset = box_end
+            continue
+        next_header = fp_read_box_header(data, box_end, file_size)
+        grouped_records = fp_collect_sample_records_for_single_moof(data, tracks, primary_track_id, box_start, box_end, box_header, next_header)
+        for chunk_records in grouped_records:
+            if chunk_records:
+                yield chunk_records
+        if next_header is not None and next_header[3] == "mdat":
+            offset = next_header[1]
+        else:
+            offset = box_end
+
+
+def fp_stream_decrypted_sample_size(file_handle, sample_offset: int, sample_size: int, sample_aux, track, key, fix_sei: bool) -> int:
+    if fix_sei:
+        return len(fp_decrypt_sample_to_bytes_from_file(file_handle, sample_offset, sample_size, sample_aux, track, key, fix_sei=True))
+    return sample_size
+
+
+def fp_collect_direct_flatten_stats(data, file_handle, tracks, primary_track_id: int, primary_track, primary_key, fix_sei: bool) -> Dict[str, int]:
+    sample_count = 0
+    chunk_count = 0
+    media_payload_size = 0
+    total_duration = 0
+    for chunk_records in fp_iter_primary_stream_chunks(data, tracks, primary_track_id):
+        chunk_samples = 0
+        chunk_payload_size = 0
+        for sample_offset, sample_size, sample_aux, track_id, sample_duration, sample_cto, sample_flags in chunk_records:
+            out_size = fp_stream_decrypted_sample_size(file_handle, sample_offset, sample_size, sample_aux, primary_track, primary_key, fix_sei)
+            sample_count += 1
+            chunk_samples += 1
+            chunk_payload_size += out_size
+            total_duration += int(sample_duration or 0)
+        if chunk_samples > 0:
+            chunk_count += 1
+            media_payload_size += chunk_payload_size
+    return {
+        "sample_count": sample_count,
+        "chunk_count": chunk_count,
+        "media_payload_size": media_payload_size,
+        "total_duration": total_duration,
+    }
+
+
+def fp_iter_direct_flatten_sample_values(data, file_handle, tracks, primary_track_id: int, primary_track, primary_key, fix_sei: bool, duration_delta: int = 0):
+    produced = 0
+    total_samples = None
+    if duration_delta:
+        total_samples = 0
+        for chunk_records in fp_iter_primary_stream_chunks(data, tracks, primary_track_id):
+            total_samples += len(chunk_records)
+    for chunk_records in fp_iter_primary_stream_chunks(data, tracks, primary_track_id):
+        for sample_offset, sample_size, sample_aux, track_id, sample_duration, sample_cto, sample_flags in chunk_records:
+            produced += 1
+            out_size = fp_stream_decrypted_sample_size(file_handle, sample_offset, sample_size, sample_aux, primary_track, primary_key, fix_sei)
+            duration = int(sample_duration or 0)
+            if duration_delta and total_samples is not None and produced == total_samples:
+                duration = (duration + duration_delta) & 0xFFFFFFFF
+            yield {
+                "duration": duration,
+                "cto": int(sample_cto or 0),
+                "size": out_size,
+                "flags": int(sample_flags or 0),
+            }
+
+
+def fp_count_compressed_entries_from_values(values) -> int:
+    count = 0
+    previous = None
+    for value in values:
+        if previous is None or value != previous:
+            count += 1
+            previous = value
+    return count
+
+
+def fp_count_stsc_entries(data, tracks, primary_track_id: int) -> int:
+    count = 0
+    previous = None
+    for chunk_records in fp_iter_primary_stream_chunks(data, tracks, primary_track_id):
+        samples_per_chunk = len(chunk_records)
+        if samples_per_chunk <= 0:
+            continue
+        if previous is None or samples_per_chunk != previous:
+            count += 1
+            previous = samples_per_chunk
+    return count
+
+
+def fp_count_sync_samples(data, file_handle, tracks, primary_track_id: int, primary_track, primary_key, fix_sei: bool, duration_delta: int = 0) -> int:
+    count = 0
+    for item in fp_iter_direct_flatten_sample_values(data, file_handle, tracks, primary_track_id, primary_track, primary_key, fix_sei, duration_delta=duration_delta):
+        if not (item["flags"] & 0x00010000):
+            count += 1
+    return count
+
+
+def fp_get_stsd_from_first_stbl(moov_blob: bytes, moov_box: Box) -> Optional[bytes]:
+    for trak in moov_box.children:
+        if trak.type != b"trak":
+            continue
+        for mdia in trak.children:
+            if mdia.type != b"mdia":
+                continue
+            for minf in mdia.children:
+                if minf.type != b"minf":
+                    continue
+                for stbl in minf.children:
+                    if stbl.type != b"stbl":
+                        continue
+                    for child in stbl.children:
+                        if child.type == b"stsd":
+                            return moov_blob[child.start:child.end]
+    return None
+
+
+def fp_direct_flatten_table_sizes(stsd_size: int, sample_count: int, chunk_count: int, stts_count: int, ctts_count: int, stsc_count: int, sync_count: int, use_co64: bool) -> Dict[str, int]:
+    chunk_offset_entry_size = 8 if use_co64 else 4
+    return {
+        "stsd": stsd_size,
+        "stts": 16 + 8 * stts_count,
+        "ctts": 16 + 8 * ctts_count,
+        "stsc": 16 + 12 * stsc_count,
+        "stsz": 20 + 4 * sample_count,
+        "chunk_table": 16 + chunk_offset_entry_size * chunk_count,
+        "stss": 16 + 4 * sync_count,
+        "sdtp": 12 + sample_count,
+    }
+
+
+def fp_direct_flatten_stbl_size(table_sizes: Dict[str, int]) -> int:
+    return 8 + sum(table_sizes.values())
+
+
+def fp_compute_rebuilt_box_size(current: Box, replacement_stbl_size: int) -> int:
+    if current.type == b"mvex":
+        return 0
+    if current.type == b"stbl":
+        return replacement_stbl_size
+    if current.children:
+        payload_size = 0
+        payload_start = current.start + current.header_size
+        position = payload_start
+        for child in current.children:
+            if position < child.start:
+                payload_size += child.start - position
+            payload_size += fp_compute_rebuilt_box_size(child, replacement_stbl_size)
+            position = child.end
+        if position < current.end:
+            payload_size += current.end - position
+        return 8 + payload_size
+    return current.size
+
+
+def fp_write_progress(out_file, progress: Optional[ProgressPrinter] = None):
+    if progress:
+        progress.update(out_file.tell())
+
+
+FP_STREAM_TABLE_BUFFER = 1024 * 1024
+
+
+def fp_flush_table_buffer(out_file, buffer: bytearray, progress: Optional[ProgressPrinter] = None):
+    if buffer:
+        out_file.write(buffer)
+        buffer.clear()
+        fp_write_progress(out_file, progress)
+
+
+def fp_buffer_table_bytes(out_file, buffer: bytearray, payload: bytes, progress: Optional[ProgressPrinter] = None):
+    if not payload:
+        return
+    if len(payload) > FP_STREAM_TABLE_BUFFER:
+        fp_flush_table_buffer(out_file, buffer, progress)
+        out_file.write(payload)
+        fp_write_progress(out_file, progress)
+        return
+    if len(buffer) + len(payload) > FP_STREAM_TABLE_BUFFER:
+        fp_flush_table_buffer(out_file, buffer, progress)
+    buffer.extend(payload)
+
+
+def fp_write_box_header_known(out_file, box_type: bytes, total_size: int, progress: Optional[ProgressPrinter] = None):
+    if total_size <= 0xFFFFFFFF:
+        out_file.write(struct.pack(">I4s", total_size, box_type))
+    else:
+        out_file.write(struct.pack(">I4sQ", 1, box_type, total_size))
+    fp_write_progress(out_file, progress)
+
+
+def fp_write_full_box_header_known(out_file, box_type: bytes, total_size: int, version: int = 0, flags: int = 0, progress: Optional[ProgressPrinter] = None):
+    fp_write_box_header_known(out_file, box_type, total_size, progress=None)
+    out_file.write(bytes([version & 0xFF]) + (flags & 0xFFFFFF).to_bytes(3, "big"))
+    fp_write_progress(out_file, progress)
+
+
+def fp_stream_copy_moov_blob_range(moov_blob: bytes, out_file, start: int, end: int, progress: Optional[ProgressPrinter] = None):
+    position = start
+    while position < end:
+        chunk_end = min(end, position + FP_STREAM_COPY_CHUNK)
+        out_file.write(moov_blob[position:chunk_end])
+        position = chunk_end
+        fp_write_progress(out_file, progress)
+
+
+def fp_write_compressed_time_table(out_file, box_type: bytes, total_size: int, entry_count: int, values, progress: Optional[ProgressPrinter] = None):
+    fp_write_full_box_header_known(out_file, box_type, total_size, 0, 0, progress=None)
+    out_file.write(struct.pack(">I", entry_count))
+    previous = None
+    run_count = 0
+    buffer = bytearray()
+    for value in values:
+        if previous is None:
+            previous = value
+            run_count = 1
+        elif value == previous:
+            run_count += 1
+        else:
+            fp_buffer_table_bytes(out_file, buffer, struct.pack(">II", run_count, previous & 0xFFFFFFFF), progress)
+            previous = value
+            run_count = 1
+    if previous is not None:
+        fp_buffer_table_bytes(out_file, buffer, struct.pack(">II", run_count, previous & 0xFFFFFFFF), progress)
+    fp_flush_table_buffer(out_file, buffer, progress)
+
+
+def fp_write_stsc_direct(out_file, total_size: int, entry_count: int, data, tracks, primary_track_id: int, progress: Optional[ProgressPrinter] = None):
+    fp_write_full_box_header_known(out_file, b"stsc", total_size, 0, 0, progress=None)
+    out_file.write(struct.pack(">I", entry_count))
+    previous = None
+    chunk_index = 0
+    buffer = bytearray()
+    for chunk_records in fp_iter_primary_stream_chunks(data, tracks, primary_track_id):
+        samples_per_chunk = len(chunk_records)
+        if samples_per_chunk <= 0:
+            continue
+        chunk_index += 1
+        if previous is None or samples_per_chunk != previous:
+            fp_buffer_table_bytes(out_file, buffer, struct.pack(">III", chunk_index, samples_per_chunk, 1), progress)
+            previous = samples_per_chunk
+    fp_flush_table_buffer(out_file, buffer, progress)
+
+
+def fp_write_stsz_direct(out_file, total_size: int, sample_count: int, data, file_handle, tracks, primary_track_id: int, primary_track, primary_key, fix_sei: bool, duration_delta: int, progress: Optional[ProgressPrinter] = None):
+    fp_write_full_box_header_known(out_file, b"stsz", total_size, 0, 0, progress=None)
+    out_file.write(struct.pack(">II", 0, sample_count))
+    buffer = bytearray()
+    for item in fp_iter_direct_flatten_sample_values(data, file_handle, tracks, primary_track_id, primary_track, primary_key, fix_sei, duration_delta=duration_delta):
+        fp_buffer_table_bytes(out_file, buffer, struct.pack(">I", item["size"] & 0xFFFFFFFF), progress)
+    fp_flush_table_buffer(out_file, buffer, progress)
+
+
+def fp_write_chunk_offsets_direct(out_file, total_size: int, mdat_data_start: int, use_co64: bool, data, file_handle, tracks, primary_track_id: int, primary_track, primary_key, fix_sei: bool, progress: Optional[ProgressPrinter] = None):
+    box_type = b"co64" if use_co64 else b"stco"
+    fp_write_full_box_header_known(out_file, box_type, total_size, 0, 0, progress=None)
+    chunk_count = 0
+    for _ in fp_iter_primary_stream_chunks(data, tracks, primary_track_id):
+        chunk_count += 1
+    out_file.write(struct.pack(">I", chunk_count))
+    cursor = mdat_data_start
+    buffer = bytearray()
+    for chunk_records in fp_iter_primary_stream_chunks(data, tracks, primary_track_id):
+        if use_co64:
+            fp_buffer_table_bytes(out_file, buffer, struct.pack(">Q", cursor), progress)
+        else:
+            fp_buffer_table_bytes(out_file, buffer, struct.pack(">I", cursor & 0xFFFFFFFF), progress)
+        chunk_payload_size = 0
+        for sample_offset, sample_size, sample_aux, track_id, sample_duration, sample_cto, sample_flags in chunk_records:
+            chunk_payload_size += fp_stream_decrypted_sample_size(file_handle, sample_offset, sample_size, sample_aux, primary_track, primary_key, fix_sei)
+        cursor += chunk_payload_size
+    fp_flush_table_buffer(out_file, buffer, progress)
+
+
+def fp_write_stss_direct(out_file, total_size: int, sync_count: int, data, file_handle, tracks, primary_track_id: int, primary_track, primary_key, fix_sei: bool, duration_delta: int, progress: Optional[ProgressPrinter] = None):
+    fp_write_full_box_header_known(out_file, b"stss", total_size, 0, 0, progress=None)
+    out_file.write(struct.pack(">I", sync_count))
+    index = 0
+    buffer = bytearray()
+    for item in fp_iter_direct_flatten_sample_values(data, file_handle, tracks, primary_track_id, primary_track, primary_key, fix_sei, duration_delta=duration_delta):
+        index += 1
+        if not (item["flags"] & 0x00010000):
+            fp_buffer_table_bytes(out_file, buffer, struct.pack(">I", index), progress)
+    fp_flush_table_buffer(out_file, buffer, progress)
+
+
+def fp_write_sdtp_direct(out_file, total_size: int, data, file_handle, tracks, primary_track_id: int, primary_track, primary_key, fix_sei: bool, duration_delta: int, progress: Optional[ProgressPrinter] = None):
+    fp_write_full_box_header_known(out_file, b"sdtp", total_size, 0, 0, progress=None)
+    buffer = bytearray()
+    for item in fp_iter_direct_flatten_sample_values(data, file_handle, tracks, primary_track_id, primary_track, primary_key, fix_sei, duration_delta=duration_delta):
+        sample_flags = item["flags"]
+        sample_depends_on = (sample_flags >> 24) & 0x03
+        sample_is_depended_on = (sample_flags >> 22) & 0x03
+        sample_has_redundancy = (sample_flags >> 20) & 0x03
+        fp_buffer_table_bytes(out_file, buffer, bytes([(sample_depends_on << 4) | (sample_is_depended_on << 2) | sample_has_redundancy]), progress)
+    fp_flush_table_buffer(out_file, buffer, progress)
+
+
+def fp_write_stbl_direct(out_file, moov_blob: bytes, stsd_bytes: bytes, table_sizes: Dict[str, int], sample_count: int, chunk_count: int, stts_count: int, ctts_count: int, stsc_count: int, sync_count: int, mdat_data_start: int, use_co64: bool, data, file_handle, tracks, primary_track_id: int, primary_track, primary_key, fix_sei: bool, duration_delta: int, progress: Optional[ProgressPrinter] = None):
+    fp_write_box_header_known(out_file, b"stbl", fp_direct_flatten_stbl_size(table_sizes), progress=None)
+    out_file.write(stsd_bytes)
+    fp_write_progress(out_file, progress)
+    print("Writing media tables: stsd done", file=sys.stderr, flush=True)
+    fp_write_compressed_time_table(
+        out_file,
+        b"stts",
+        table_sizes["stts"],
+        stts_count,
+        (item["duration"] for item in fp_iter_direct_flatten_sample_values(data, file_handle, tracks, primary_track_id, primary_track, primary_key, fix_sei, duration_delta=duration_delta)),
+        progress,
+    )
+    print("Writing media tables: stts done", file=sys.stderr, flush=True)
+    fp_write_compressed_time_table(
+        out_file,
+        b"ctts",
+        table_sizes["ctts"],
+        ctts_count,
+        (item["cto"] for item in fp_iter_direct_flatten_sample_values(data, file_handle, tracks, primary_track_id, primary_track, primary_key, fix_sei, duration_delta=duration_delta)),
+        progress,
+    )
+    print("Writing media tables: ctts done", file=sys.stderr, flush=True)
+    fp_write_stsc_direct(out_file, table_sizes["stsc"], stsc_count, data, tracks, primary_track_id, progress)
+    print("Writing media tables: stsc done", file=sys.stderr, flush=True)
+    fp_write_stsz_direct(out_file, table_sizes["stsz"], sample_count, data, file_handle, tracks, primary_track_id, primary_track, primary_key, fix_sei, duration_delta, progress)
+    print("Writing media tables: stsz done", file=sys.stderr, flush=True)
+    fp_write_chunk_offsets_direct(out_file, table_sizes["chunk_table"], mdat_data_start, use_co64, data, file_handle, tracks, primary_track_id, primary_track, primary_key, fix_sei, progress)
+    print("Writing media tables: chunk offsets done", file=sys.stderr, flush=True)
+    fp_write_stss_direct(out_file, table_sizes["stss"], sync_count, data, file_handle, tracks, primary_track_id, primary_track, primary_key, fix_sei, duration_delta, progress)
+    print("Writing media tables: stss done", file=sys.stderr, flush=True)
+    fp_write_sdtp_direct(out_file, table_sizes["sdtp"], data, file_handle, tracks, primary_track_id, primary_track, primary_key, fix_sei, duration_delta, progress)
+
+
+def fp_write_rebuilt_moov_direct(out_file, current: Box, moov_blob: bytes, replacement_stbl_size: int, stsd_bytes: bytes, table_sizes: Dict[str, int], sample_count: int, chunk_count: int, stts_count: int, ctts_count: int, stsc_count: int, sync_count: int, mdat_data_start: int, use_co64: bool, data, file_handle, tracks, primary_track_id: int, primary_track, primary_key, fix_sei: bool, duration_delta: int, progress: Optional[ProgressPrinter] = None):
+    if current.type == b"mvex":
+        return
+    if current.type == b"stbl":
+        fp_write_stbl_direct(out_file, moov_blob, stsd_bytes, table_sizes, sample_count, chunk_count, stts_count, ctts_count, stsc_count, sync_count, mdat_data_start, use_co64, data, file_handle, tracks, primary_track_id, primary_track, primary_key, fix_sei, duration_delta, progress)
+        return
+    if current.children:
+        size = fp_compute_rebuilt_box_size(current, replacement_stbl_size)
+        fp_write_box_header_known(out_file, current.type, size, progress=None)
+        payload_start = current.start + current.header_size
+        position = payload_start
+        for child in current.children:
+            if position < child.start:
+                fp_stream_copy_moov_blob_range(moov_blob, out_file, position, child.start, progress)
+            fp_write_rebuilt_moov_direct(out_file, child, moov_blob, replacement_stbl_size, stsd_bytes, table_sizes, sample_count, chunk_count, stts_count, ctts_count, stsc_count, sync_count, mdat_data_start, use_co64, data, file_handle, tracks, primary_track_id, primary_track, primary_key, fix_sei, duration_delta, progress)
+            position = child.end
+        if position < current.end:
+            fp_stream_copy_moov_blob_range(moov_blob, out_file, position, current.end, progress)
+        fp_write_progress(out_file, progress)
+        return
+    fp_stream_copy_moov_blob_range(moov_blob, out_file, current.start, current.end, progress)
+
+
 def fp_decrypt_mp4_large_streaming_flatten(input_path: str, output_path: str, data, file_handle, tracks, fast_keys, drop_text: bool, fix_sei: bool, reason: str):
     file_size = len(data)
-    primary_track_id = fp_choose_v4_primary_track(tracks)
+    primary_track_id = fp_choose_stream_primary_track(tracks)
     if primary_track_id is None:
         with open(output_path, "wb") as out_file:
-            fp_stream_copy_file_range(file_handle, out_file, 0, file_size)
+            progress = ProgressPrinter(file_size)
+            fp_stream_copy_file_range(file_handle, out_file, 0, file_size, progress)
+            progress.finish()
         print("No encrypted fragmented samples found")
         return
     primary_track = tracks[primary_track_id]
-    primary_key = fp_resolve_v4_fast_key(primary_track_id, primary_track, fast_keys)
+    primary_key = fp_resolve_stream_fast_key(primary_track_id, primary_track, fast_keys)
 
     ftyp_start = ftyp_end = moov_start = moov_end = None
     for box_start, box_end, box_header, box_type in fp_children(data, 0, file_size):
@@ -4333,228 +4695,155 @@ def fp_decrypt_mp4_large_streaming_flatten(input_path: str, output_path: str, da
         elif box_type == "moov" and moov_start is None:
             moov_start, moov_end = box_start, box_end
     if ftyp_start is None or moov_start is None:
-        fail("Missing ftyp/moov boxes in v4 streaming flatten path")
+        fail("Missing ftyp/moov boxes in streaming flatten path")
 
-    print(f"Detected large/long fragmented MP4 ({reason}); using v4 streaming decrypt + flat rewrite.")
-    temp_paths: List[str] = []
-    output_temp_path = output_path + ".stream.tmp"
-    output_dir = os.path.dirname(os.path.abspath(output_path)) or "."
-    table_handles = {}
-    table_paths = {}
-    media_temp = None
-    media_temp_path = None
-    try:
-        for name in ("durations", "ctos", "sizes", "flags"):
-            handle = tempfile.NamedTemporaryFile(prefix=f"pydecrypt_v4_{name}_", suffix=".bin", dir=output_dir, delete=False)
-            table_handles[name] = handle
-            table_paths[name] = handle.name
-            temp_paths.append(handle.name)
-        media_temp = tempfile.NamedTemporaryFile(prefix="pydecrypt_v4_mdat_", suffix=".bin", dir=output_dir, delete=False)
-        media_temp_path = media_temp.name
-        temp_paths.append(media_temp_path)
+    print(f"Detected large/long fragmented MP4 ({reason}); using direct streaming decrypt + flat rewrite.")
+    stats = fp_collect_direct_flatten_stats(data, file_handle, tracks, primary_track_id, primary_track, primary_key, fix_sei)
+    sample_count = stats["sample_count"]
+    chunk_count = stats["chunk_count"]
+    media_payload_size = stats["media_payload_size"]
+    total_duration = stats["total_duration"]
+    if sample_count <= 0:
+        with open(output_path, "wb") as out_file:
+            progress = ProgressPrinter(file_size)
+            fp_stream_copy_file_range(file_handle, out_file, 0, file_size, progress)
+            progress.finish()
+        print("No encrypted fragmented samples found")
+        return
 
-        sample_count = 0
-        total_duration = 0
-        media_payload_size = 0
-        chunk_sample_counts: List[int] = []
-        chunk_payload_sizes: List[int] = []
-        progress = ProgressPrinter(file_size)
+    moov_blob = bytearray(data[moov_start:moov_end])
+    moov_patches: List[Tuple[int, bytes]] = []
+    if drop_text:
+        moov_patches.extend((pos, payload) for pos, payload in fp_collect_text_track_patches(data) if moov_start <= pos < moov_end)
+    moov_patches.extend(fp_collect_decrypted_mp4_metadata_patches_for_moov(data, tracks, moov_start, moov_end))
+    fp_apply_absolute_patches_to_blob(moov_blob, moov_start, fp_prepare_patch_events(moov_patches))
+    moov_bytes = bytes(moov_blob)
+    moov_parser = Mp4Parser(moov_bytes)
+    moov_box = None
+    for top in moov_parser.root:
+        if top.type == b"moov":
+            moov_box = top
+            break
+    if moov_box is None:
+        fail("No moov box found while preparing streaming output")
+    stsd_bytes = fp_get_stsd_from_first_stbl(moov_bytes, moov_box)
+    if not stsd_bytes:
+        fail("No stsd box found while preparing streaming output")
+    target_duration = fp_get_track_duration_from_moov(moov_bytes, moov_box)
+    duration_delta = 0
+    if target_duration > 0 and sample_count > 0:
+        candidate_delta = target_duration - total_duration
+        if 0 < candidate_delta <= 1000000000:
+            duration_delta = candidate_delta
 
+    stts_count = fp_count_compressed_entries_from_values(
+        item["duration"] for item in fp_iter_direct_flatten_sample_values(data, file_handle, tracks, primary_track_id, primary_track, primary_key, fix_sei, duration_delta=duration_delta)
+    )
+    ctts_count = fp_count_compressed_entries_from_values(
+        item["cto"] for item in fp_iter_direct_flatten_sample_values(data, file_handle, tracks, primary_track_id, primary_track, primary_key, fix_sei, duration_delta=duration_delta)
+    )
+    stsc_count = fp_count_stsc_entries(data, tracks, primary_track_id)
+    sync_count = fp_count_sync_samples(data, file_handle, tracks, primary_track_id, primary_track, primary_key, fix_sei, duration_delta=duration_delta)
+
+    ftyp_size = ftyp_end - ftyp_start
+    mdat_header_size = 16 if media_payload_size + 8 > 0xFFFFFFFF else 8
+    mdat_data_start = ftyp_size + mdat_header_size
+    use_co64 = (mdat_data_start + media_payload_size) > 0xFFFFFFFF
+    table_sizes = fp_direct_flatten_table_sizes(len(stsd_bytes), sample_count, chunk_count, stts_count, ctts_count, stsc_count, sync_count, use_co64)
+    replacement_stbl_size = fp_direct_flatten_stbl_size(table_sizes)
+    rebuilt_moov_size = fp_compute_rebuilt_box_size(moov_box, replacement_stbl_size)
+    final_output_size = ftyp_size + mdat_header_size + media_payload_size + rebuilt_moov_size
+
+    progress = ProgressPrinter(final_output_size)
+    with open(output_path, "wb") as out_file:
+        fp_stream_copy_file_range(file_handle, out_file, ftyp_start, ftyp_end, None)
+        fp_write_progress(out_file, progress)
+        out_file.write(fp_make_box_header(b"mdat", media_payload_size))
+        fp_write_progress(out_file, progress)
+        for chunk_records in fp_iter_primary_stream_chunks(data, tracks, primary_track_id):
+            for sample_offset, sample_size, sample_aux, track_id, sample_duration, sample_cto, sample_flags in chunk_records:
+                decrypted = fp_decrypt_sample_to_bytes_from_file(file_handle, sample_offset, sample_size, sample_aux, primary_track, primary_key, fix_sei=fix_sei)
+                out_file.write(decrypted)
+                fp_write_progress(out_file, progress)
+        print("Writing final metadata tables", file=sys.stderr, flush=True)
+        fp_write_rebuilt_moov_direct(out_file, moov_box, moov_bytes, replacement_stbl_size, stsd_bytes, table_sizes, sample_count, chunk_count, stts_count, ctts_count, stsc_count, sync_count, mdat_data_start, use_co64, data, file_handle, tracks, primary_track_id, primary_track, primary_key, fix_sei, duration_delta, progress)
+    progress.finish()
+    print(
+        "Streaming path decrypted and flattened "
+        f"{sample_count} samples into {chunk_count} chunks without sidecar files."
+    )
+
+def fp_decrypt_mp4_large_streaming(input_path: str, output_path: str, data, file_handle, tracks, fast_keys, drop_text: bool, fix_sei: bool, reason: str):
+    file_size = len(data)
+    progress = ProgressPrinter(file_size)
+    processed_samples = 0
+    print(f"Detected large/long fragmented MP4 ({reason}); using bounded-memory streaming path.")
+    with open(output_path, "wb") as out_file:
         offset = 0
         while offset + 8 <= file_size:
             header = fp_read_box_header(data, offset, file_size)
             if header is None:
                 break
             box_start, box_end, box_header, box_type = header
-            if box_type != "moof":
-                progress.update(box_end)
+            if box_type == "moov":
+                patches: List[Tuple[int, bytes]] = []
+                if drop_text:
+                    patches.extend((pos, payload) for pos, payload in fp_collect_text_track_patches(data) if box_start <= pos < box_end)
+                patches.extend(fp_collect_decrypted_mp4_metadata_patches_for_moov(data, tracks, box_start, box_end))
+                fp_write_patched_box_range(data, out_file, box_start, box_end, fp_prepare_patch_events(patches), progress)
                 fp_madvise_dontneed(data, box_start, box_end)
                 offset = box_end
                 continue
-            next_header = fp_read_box_header(data, box_end, file_size)
-            grouped_records = fp_collect_sample_records_for_single_moof(data, tracks, primary_track_id, box_start, box_end, box_header, next_header)
-            for chunk_records in grouped_records:
-                chunk_count = 0
-                chunk_payload_size = 0
-                for sample_offset, sample_size, sample_aux, track_id, sample_duration, sample_cto, sample_flags in chunk_records:
-                    decrypted = fp_decrypt_sample_to_bytes_from_file(file_handle, sample_offset, sample_size, sample_aux, primary_track, primary_key, fix_sei=fix_sei)
-                    media_temp.write(decrypted)
-                    fp_write_u32(table_handles["durations"], int(sample_duration or 0))
-                    fp_write_u32(table_handles["ctos"], int(sample_cto or 0))
-                    fp_write_u32(table_handles["sizes"], len(decrypted))
-                    fp_write_u32(table_handles["flags"], int(sample_flags or 0))
-                    sample_count += 1
-                    total_duration += int(sample_duration or 0)
-                    chunk_count += 1
-                    chunk_payload_size += len(decrypted)
-                if chunk_count > 0:
-                    chunk_sample_counts.append(chunk_count)
-                    chunk_payload_sizes.append(chunk_payload_size)
-                    media_payload_size += chunk_payload_size
-            progress.update(box_end)
-            fp_madvise_dontneed(data, box_start, box_end)
-            if next_header is not None and next_header[3] == "mdat":
-                fp_madvise_dontneed(data, next_header[0], next_header[1])
-                offset = next_header[1]
-                progress.update(offset)
-            else:
-                offset = box_end
-        progress.finish()
 
-        for handle in table_handles.values():
-            handle.close()
-        media_temp.flush()
-        media_temp.close()
-        media_temp = None
-
-        if sample_count <= 0:
-            with open(output_path, "wb") as out_file:
-                fp_stream_copy_file_range(file_handle, out_file, 0, file_size)
-            print("No encrypted fragmented samples found")
-            return
-
-        moov_blob = bytearray(data[moov_start:moov_end])
-        moov_patches: List[Tuple[int, bytes]] = []
-        if drop_text:
-            moov_patches.extend((pos, payload) for pos, payload in fp_collect_text_track_patches(data) if moov_start <= pos < moov_end)
-        moov_patches.extend(fp_collect_decrypted_mp4_metadata_patches_for_moov(data, tracks, moov_start, moov_end))
-        fp_apply_absolute_patches_to_blob(moov_blob, moov_start, fp_prepare_patch_events(moov_patches))
-        ftyp_bytes = bytes(data[ftyp_start:ftyp_end])
-        target_duration = fp_get_track_duration_from_moov(bytes(moov_blob), Mp4Parser(bytes(moov_blob)).root[0])
-        if target_duration <= 0:
-            target_duration = None
-
-        mdat_header_size = 16 if media_payload_size + 8 > 0xFFFFFFFF else 8
-        new_moov = b""
-        chunk_offsets: List[int] = []
-        for _ in range(8):
-            mdat_data_start = len(ftyp_bytes) + len(new_moov) + mdat_header_size
-            chunk_offsets = []
-            cursor = mdat_data_start
-            for chunk_payload_size in chunk_payload_sizes:
-                chunk_offsets.append(cursor)
-                cursor += chunk_payload_size
-            rebuilt = fp_rebuild_moov_for_v4_stream_flatten(bytes(moov_blob), table_paths, sample_count, chunk_sample_counts, chunk_offsets, target_duration, total_duration)
-            if rebuilt == new_moov:
-                new_moov = rebuilt
-                break
-            new_moov = rebuilt
-
-        with open(output_temp_path, "wb") as out_file:
-            out_file.write(ftyp_bytes)
-            out_file.write(new_moov)
-            out_file.write(fp_make_box_header(b"mdat", media_payload_size))
-            with open(media_temp_path, "rb") as media_in:
-                fp_copy_fileobj_range(media_in, out_file, media_payload_size)
-        os.replace(output_temp_path, output_path)
-        print(
-            "v4 streaming path decrypted and flattened "
-            f"{sample_count} samples into {len(chunk_sample_counts)} chunks without full-file buffering."
-        )
-    except Exception:
-        try:
-            if os.path.exists(output_temp_path):
-                os.remove(output_temp_path)
-        finally:
-            raise
-    finally:
-        for handle in table_handles.values():
-            try:
-                handle.close()
-            except Exception:
-                pass
-        if media_temp is not None:
-            try:
-                media_temp.close()
-            except Exception:
-                pass
-        for temp_path in temp_paths:
-            try:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-            except Exception:
-                pass
-
-def fp_decrypt_mp4_large_streaming(input_path: str, output_path: str, data, file_handle, tracks, fast_keys, drop_text: bool, fix_sei: bool, reason: str):
-    file_size = len(data)
-    progress = ProgressPrinter(file_size)
-    processed_samples = 0
-    print(f"Detected large/long fragmented MP4 ({reason}); using v4 bounded-memory streaming path.")
-    temp_path = output_path + ".stream.tmp"
-    try:
-        with open(temp_path, "wb") as out_file:
-            offset = 0
-            while offset + 8 <= file_size:
-                header = fp_read_box_header(data, offset, file_size)
-                if header is None:
-                    break
-                box_start, box_end, box_header, box_type = header
-                if box_type == "moov":
-                    patches: List[Tuple[int, bytes]] = []
-                    if drop_text:
-                        patches.extend((pos, payload) for pos, payload in fp_collect_text_track_patches(data) if box_start <= pos < box_end)
-                    patches.extend(fp_collect_decrypted_mp4_metadata_patches_for_moov(data, tracks, box_start, box_end))
-                    fp_write_patched_box_range(data, out_file, box_start, box_end, fp_prepare_patch_events(patches), progress)
-                    fp_madvise_dontneed(data, box_start, box_end)
-                    offset = box_end
-                    continue
-
-                if box_type == "moof":
-                    next_header = fp_read_box_header(data, box_end, file_size)
-                    fragments = fp_collect_fragments_for_single_moof(data, tracks, box_start, box_end, box_header, next_header)
-                    decrypt_events = fp_prepare_decrypt_events(fragments, tracks, fast_keys) if fragments else []
-                    growth_patches, repaired_sei_count = fp_collect_growth_patches(data, decrypt_events, fix_sei=fix_sei) if decrypt_events else ([], 0)
-                    moof_patches = fp_collect_fragment_metadata_patches_for_range(data, box_start, box_end)
-                    moof_patches.extend((pos, payload) for pos, payload in growth_patches if box_start <= pos < box_end)
-                    fp_write_patched_box_range(data, out_file, box_start, box_end, fp_prepare_patch_events(moof_patches), progress)
-                    fp_madvise_dontneed(data, box_start, box_end)
-
-                    if next_header is not None and next_header[3] == "mdat":
-                        mdat_start, mdat_end, mdat_header, mdat_type = next_header
-                        mdat_patch_events = [
-                            (pos, pos + len(payload), "patch", payload)
-                            for pos, payload in growth_patches
-                            if mdat_start <= pos < mdat_end and payload
-                        ]
-                        processed_samples += fp_stream_write_range_with_events(
-                            file_handle,
-                            data,
-                            out_file,
-                            mdat_start,
-                            mdat_end,
-                            mdat_patch_events + decrypt_events,
-                            progress,
-                            fix_sei=fix_sei,
-                        )
-                        fp_madvise_dontneed(data, mdat_start, mdat_end)
-                        offset = mdat_end
-                    else:
-                        processed_samples += len(decrypt_events)
-                        offset = box_end
-                    continue
-
-                local_patches = fp_collect_top_level_box_metadata_patches(data, box_start, box_end, box_type)
-                if local_patches:
-                    fp_write_patched_box_range(data, out_file, box_start, box_end, fp_prepare_patch_events(local_patches), progress)
-                else:
-                    fp_stream_copy_file_range(file_handle, out_file, box_start, box_end, progress)
+            if box_type == "moof":
+                next_header = fp_read_box_header(data, box_end, file_size)
+                fragments = fp_collect_fragments_for_single_moof(data, tracks, box_start, box_end, box_header, next_header)
+                decrypt_events = fp_prepare_decrypt_events(fragments, tracks, fast_keys) if fragments else []
+                growth_patches, repaired_sei_count = fp_collect_growth_patches(data, decrypt_events, fix_sei=fix_sei) if decrypt_events else ([], 0)
+                moof_patches = fp_collect_fragment_metadata_patches_for_range(data, box_start, box_end)
+                moof_patches.extend((pos, payload) for pos, payload in growth_patches if box_start <= pos < box_end)
+                fp_write_patched_box_range(data, out_file, box_start, box_end, fp_prepare_patch_events(moof_patches), progress)
                 fp_madvise_dontneed(data, box_start, box_end)
-                offset = box_end
 
-            if offset < file_size:
-                fp_stream_copy_file_range(file_handle, out_file, offset, file_size, progress)
-        progress.finish()
-        os.replace(temp_path, output_path)
-        if processed_samples <= 0:
-            print("No encrypted fragmented samples found")
-        else:
-            print(f"v4 streaming path decrypted {processed_samples} samples without flattening or full-file buffering.")
-    except Exception:
-        try:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-        finally:
-            raise
+                if next_header is not None and next_header[3] == "mdat":
+                    mdat_start, mdat_end, mdat_header, mdat_type = next_header
+                    mdat_patch_events = [
+                        (pos, pos + len(payload), "patch", payload)
+                        for pos, payload in growth_patches
+                        if mdat_start <= pos < mdat_end and payload
+                    ]
+                    processed_samples += fp_stream_write_range_with_events(
+                        file_handle,
+                        data,
+                        out_file,
+                        mdat_start,
+                        mdat_end,
+                        mdat_patch_events + decrypt_events,
+                        progress,
+                        fix_sei=fix_sei,
+                    )
+                    fp_madvise_dontneed(data, mdat_start, mdat_end)
+                    offset = mdat_end
+                else:
+                    processed_samples += len(decrypt_events)
+                    offset = box_end
+                continue
+
+            local_patches = fp_collect_top_level_box_metadata_patches(data, box_start, box_end, box_type)
+            if local_patches:
+                fp_write_patched_box_range(data, out_file, box_start, box_end, fp_prepare_patch_events(local_patches), progress)
+            else:
+                fp_stream_copy_file_range(file_handle, out_file, box_start, box_end, progress)
+            fp_madvise_dontneed(data, box_start, box_end)
+            offset = box_end
+
+        if offset < file_size:
+            fp_stream_copy_file_range(file_handle, out_file, offset, file_size, progress)
+    progress.finish()
+    if processed_samples <= 0:
+        print("No encrypted fragmented samples found")
+    else:
+        print(f"Streaming path decrypted {processed_samples} samples without flattening or full-file buffering.")
 
 def decrypt_mp4_file(input_path: str, output_path: str, keys_by_track: Dict[int, bytes], keys_by_kid: Dict[bytes, bytes], show_tracks: bool = False, drop_text: bool = True, fix_sei: bool = False):
     if not os.path.isfile(input_path):
@@ -4593,7 +4882,7 @@ def decrypt_mp4_file(input_path: str, output_path: str, keys_by_track: Dict[int,
                     encrypted = "yes" if track["encrypted"] else "no"
                     print(f"  track={track_id} handler={track['handler']} entry={track['entry_type']} encrypted={encrypted} scheme={track['scheme']}")
 
-            use_streaming, streaming_reason = fp_should_use_v4_large_streaming(data, moov_start, moov_end)
+            use_streaming, streaming_reason = fp_should_use_large_streaming(data, moov_start, moov_end)
             if use_streaming:
                 fp_decrypt_mp4_large_streaming_flatten(input_path, output_path, data, file_handle, tracks, fast_keys, drop_text=drop_text, fix_sei=fix_sei, reason=streaming_reason)
                 print("Decrypted successfully")
